@@ -1,9 +1,15 @@
 # scanrr — Design Specification
 
-> **Status:** Draft v0.1 · **Owner:** Mark Mckessock
+> **Status:** Draft v0.2 · **Owner:** Mark Mckessock
 > This document is the **source of truth** for scanrr's design. Code follows the
 > spec; when they disagree, update the spec first. Decisions marked
 > **[OPEN]** need a call before the affected code is written.
+>
+> **v0.2** — folded in the adversarial-review outcomes: validated integrity
+> detection (§7), file-stability gate + transient-error retries + lazy
+> revalidation (§3), per-file timeouts & real cancellation via `pebble` (§6),
+> single-writer DB thread (§5), replacement verify-loop (§9), in-cluster authz
+> (§11/§14), and observability (§14a). `#n` tags trace back to review points.
 
 ---
 
@@ -48,16 +54,16 @@ re-does completed work.
 | **Job Run** | One execution of a Job. Has discovery + scan phases and aggregate stats. |
 | **Scan Task** | One file's work item inside a run — the durable queue row. |
 | **File** | A path on disk: its current hash, size, mtime, and last-scan bookkeeping. |
-| **Scan Result** | Content-addressed (keyed by hash) ffmpeg verdict: `ok` / `corrupt` / `error`. The reusable cache. |
+| **Scan Result** | Content-addressed (keyed by hash) ffmpeg verdict: `ok` / `corrupt`. The reusable cache. Transient `error`/`timeout` outcomes are *not* stored here. |
 | **Detection** | A corrupt file observed at a path, with remediation state (open → resolved). What the user triages. |
 | **Replacement** | An attempt to re-acquire a corrupt file via Sonarr/Radarr. |
 | **Arr Instance** | A configured Sonarr or Radarr endpoint (URL + API key). |
 | **Path Mapping** | Translates an arr-namespace path to scanrr's local mount path. |
 
-**Key invariant:** `Scan Result` is keyed by **content hash + detector version**,
-not by path. `File` maps path → hash. `Detection` maps a corrupt observation →
-remediation. This separation is what makes cross-path dedup and idempotent
-resume fall out naturally.
+**Key invariant:** `Scan Result` is keyed by **content hash**, valid only for a
+given **detector version + backend**, never by path. `File` maps path → hash.
+`Detection` maps a corrupt observation → remediation. This separation is what
+makes cross-path dedup and idempotent resume fall out naturally.
 
 ---
 
@@ -67,51 +73,81 @@ For each file discovered during a run:
 
 ```
 stat = os.stat(path)
+
+# 0. Stability gate — never scan a file that may still be written/importing.
+if (now - stat.mtime) < min_file_age_seconds:      # default 120s
+    skip(reason="too_fresh"); continue
+
 f = files.get(path)
 
-# 1. Cheapest path — no disk read at all.
+# 1. Cheapest path — no disk read at all. last_scanned_at is GLOBAL (a scan is a
+#    scan regardless of which job did it); TTL is evaluated against it.
 if f and f.size == stat.size and f.mtime == stat.mtime
        and f.last_scanned_at and (now - f.last_scanned_at) < job.ttl:
     skip(reason="unchanged_within_ttl"); continue
 
-# 2. Content identity — one full read to hash (blake3). Much cheaper than decode.
-h = hash_file(path)                       # blake3
+# 2. Content identity — one full read to hash (blake3). On a cache miss this is a
+#    second full read on top of the decode; accepted for the dedup benefit (#2).
+h = hash_file(path)
 
-# 3. Content-addressed cache hit — deterministic result, TTL-independent by design.
+# 3. Content-addressed cache hit — reused only if the cached verdict is still
+#    valid for the CURRENT detector (version AND backend). A mismatch is treated
+#    as a miss (falls through), NOT a forced library-wide rescan — see lazy
+#    revalidation below.
 sr = scan_results.get(h)
-if sr and sr.detector_version == CURRENT_DETECTOR_VERSION:
+if sr and sr.detector_version == CURRENT_DETECTOR_VERSION
+       and sr.detector_backend == CURRENT_DETECTOR_BACKEND:
     files.upsert(path, hash=h, size, mtime, last_scanned_at=now)
-    if sr.status == "corrupt": ensure_detection(path, h, run)
-    skip(reason="hash_cached"); continue      # <-- same bytes elsewhere already scanned
+    reconcile_detections(path, h, sr.status, run)  # open if corrupt; resolve if now-ok
+    skip(reason="hash_cached"); continue           # same bytes already scanned
 
-# 4. Cache miss — the expensive full ffmpeg integrity check.
-result = ffmpeg_integrity_check(path)     # ok | corrupt | error (+ error log)
-scan_results.upsert(h, result, detector_version=CURRENT_DETECTOR_VERSION)
-files.upsert(path, hash=h, size, mtime, last_scanned_at=now)
-if result.status == "corrupt":
-    d = ensure_detection(path, h, run)
-    if job.auto_replace: enqueue_replacement(d)
-    notify("corrupt_found", ...)
+# 4. Cache miss — the expensive full ffmpeg integrity check, bounded by a timeout.
+result = ffmpeg_integrity_check(path, timeout=max_scan_seconds)  # §6, §7
+if result.status in ("ok", "corrupt"):             # deterministic verdicts only
+    scan_results.upsert(h, result, DETECTOR_VERSION, DETECTOR_BACKEND)
+    files.upsert(path, hash=h, size, mtime, last_scanned_at=now)
+    reconcile_detections(path, h, result.status, run)
+    if result.status == "corrupt" and job.auto_replace:
+        enqueue_replacement(detection)             # §9
+else:                                              # error / timeout = TRANSIENT
+    retry_or_fail(task)                            # NOT cached by hash; see retry policy
 ```
+
+`reconcile_detections` closes the loop on remediation (#6): a `corrupt` verdict
+opens (or reuses) a detection; an `ok` verdict on a path that had an **open
+detection for a different hash** auto-resolves it (`status=resolved`). So once a
+file is replaced with a clean copy, its old detection clears itself.
 
 **Why this satisfies every requirement:**
 
-- *"Don't re-scan within TTL"* → step 1 (and TTL gates the unchanged fast path).
+- *"Don't re-scan within TTL"* → steps 0–1 (TTL gates the unchanged fast path).
 - *"Skip if hash unchanged"* → steps 1 & 3.
 - *"Skip if hash already recorded under a different path, even outside TTL"* →
-  step 3 skips regardless of TTL, because a hash → result is deterministic.
-- *"Idempotent if a scan fails"* → completed tasks are `done` in the DB and their
-  results are cached by hash; a re-run skips them in step 1/3. Nothing repeats.
+  step 3 skips regardless of TTL, because a hash → verdict is deterministic.
+- *"Idempotent if a scan fails"* → `ok`/`corrupt` tasks are terminal and cached by
+  hash; a re-run skips them in step 1/3. Transient failures retry (below).
 
-**Detector versioning:** `CURRENT_DETECTOR_VERSION` is bumped whenever the ffmpeg
-args or detection logic change. Cached results from an older detector are treated
-as misses and re-scanned — so improving detection doesn't silently trust stale verdicts.
+**Transient errors & retries (#5, #8):** `error` (couldn't open) and `timeout`
+are **not** verdicts — an NFS blip, a lock, or a still-importing file can cause
+them, so they are **never content-cached**. The task retries with exponential
+backoff up to `scan_max_attempts` (default 3); on exhaustion the task becomes
+`unreadable` and is surfaced in the UI as needs-attention — never silently
+dropped, and never confused with `corrupt`. The step-0 stability gate prevents
+most mid-write false errors up front.
 
-**Hashing:** [blake3](https://github.com/oconnor663/blake3-py) (multithreaded,
-far faster than sha256; the NFS read is the real bottleneck on large remuxes).
-Configurable to sha256. Step 1's (size, mtime) fast-path avoids even reading the
-file on the common "nothing changed" case. **[OPEN]** blake3 vs sha256 default —
-blake3 recommended.
+**Detector versioning — lazy revalidation (#7, #11):** cache validity keys on
+both `detector_version` (bumped when detection logic/args change) and
+`detector_backend`. A mismatch does **not** trigger an immediate library-wide
+re-scan (which could be days of NFS I/O). The cached verdict is shown flagged
+`stale`; the file is only re-scanned when it's next naturally due (TTL / content
+change) or via an explicit, scope-previewed **"Revalidate library"** action.
+
+**Hashing:** whole-file [blake3](https://github.com/oconnor663/blake3-py)
+(multithreaded, far faster than sha256; the NFS read dominates on large remuxes).
+The (size, mtime) fast-path (step 1) avoids reading the file at all on the common
+"nothing changed" case. The extra full read on a cache miss (#2) is an accepted
+cost — decided in favour of simple, exact whole-file dedup over a partial
+signature. **[OPEN]** blake3 vs sha256 default — blake3 recommended.
 
 ---
 
@@ -127,7 +163,10 @@ blake3 recommended.
 - **Alembic** for migrations.
 - **APScheduler** for cron-based job scheduling.
 - **httpx** for Sonarr/Radarr and Pushover clients.
-- **ProcessPoolExecutor** for the CPU-bound scan workers (§6).
+- **`pebble.ProcessPool`** for the scan workers — chosen over `ProcessPoolExecutor`
+  for **per-task timeouts** and real **cancellation** (terminates the worker
+  process), which stock futures cannot do (§6).
+- **prometheus-client** for the `/metrics` endpoint (§14a).
 
 ### Frontend
 - **React 18 + TypeScript + Vite**.
@@ -158,15 +197,18 @@ blake3 recommended.
 │                                                                │
 │  APScheduler ── triggers Jobs on cron → creates Job Runs       │
 │                                                                │
-│  Orchestrator (async, main process = SOLE DB WRITER)           │
-│    • discovery: enumerate files → insert scan_tasks (durable)  │
+│  Orchestrator (async)                                          │
+│    • discovery: enumerate files → BATCH-insert scan_tasks      │
 │    • pre-checks: TTL / hash-cache lookups (skip cheaply)       │
 │    • dispatch: submit pending tasks to the pool (bounded)      │
-│    • collect: write results, create detections, notify         │
+│    • collect: results → detections → notify                    │
 │                                                                │
-│  ProcessPoolExecutor  (N workers, pure CPU, NO DB access)      │
+│  DB writer thread (SOLE WRITER)  ← asyncio.Queue ← orchestrator │
+│    serialises all writes; reads use a threadpool (WAL)         │
+│                                                                │
+│  pebble.ProcessPool  (N workers, pure CPU, NO DB access)       │
 │    worker(path) -> (hash, status, error_log, duration_ms)      │
-│         └── blake3 hash + PyAV decode-all-frames               │
+│    per-task timeout + cancellable ── blake3 + PyAV decode      │
 │                                                                │
 │  Integrations:  Sonarr/Radarr (httpx) · Pushover (httpx)       │
 └──────────────────────────────────────────────────────────────┘
@@ -175,10 +217,14 @@ blake3 recommended.
    Synology media shares            scanrr.db (SQLite/WAL)
 ```
 
-**Single-writer design.** Only the main process touches SQLite. Worker processes
-are pure functions returning results; the orchestrator performs all reads/writes.
-This sidesteps multi-process SQLite write contention entirely while still getting
-true parallelism for the heavy decode work.
+**Single-writer design (#4).** SQLModel is synchronous, so DB calls must never run
+on the asyncio event loop. All **writes** are funnelled through one dedicated
+writer thread fed by an `asyncio.Queue`, preserving a single writer and keeping
+the loop unblocked; **reads** run in a threadpool (WAL permits concurrent readers).
+Discovery inserts are **batched** (`executemany`, commit every N rows) with
+periodic WAL checkpoints so a 100k-file enumeration can't stall the API/SSE.
+Worker processes never touch SQLite — they are pure functions returning results,
+which also sidesteps multi-process write contention.
 
 ---
 
@@ -206,19 +252,35 @@ survives restarts.
 - Global `max_scan_workers` (default **3**) and optional per-job override. Scanning
   is **NFS-read-bandwidth bound**, not CPU bound — too many parallel decodes thrash
   the network share, so the default is deliberately low. Documented in Settings.
-- Hashing and decoding both run in worker processes (true parallelism; both release
-  the GIL / run out-of-process).
+- Hashing and decoding run in separate **worker processes** (`pebble.ProcessPool`),
+  so they parallelise independently of the main process's GIL. (Being separate
+  processes, they don't share a GIL at all — the point is true parallelism, not
+  GIL release.)
 - **[OPEN]** Whether two different Jobs may run concurrently, or runs are globally
   serialized with a shared worker pool. *Recommended:* one active run at a time in
   v1 (simpler, avoids double-scanning overlapping paths); queue additional triggers.
 
+### Timeouts & cancellation (#3)
+- Every scan runs with a **per-file timeout** (`max_scan_seconds`, default 1800).
+  `pebble` terminates the worker process on expiry; the task is recorded as a
+  transient `timeout` (retryable per the §3 policy), so one pathological file can
+  never wedge a worker indefinitely.
+- `POST /api/runs/:id/cancel` sets the run `cancelling`; the orchestrator stops
+  dispatching and **terminates in-flight worker processes** (`pebble` supports
+  this — stock `ProcessPoolExecutor` does not), requeuing their `scan_tasks` to
+  `pending`, then marks the run `cancelled`.
+
+### Scheduling & misfires (#14)
+- APScheduler runs each job with `coalesce=True` and `max_instances=1`, so a job
+  can never overlap itself and a burst of missed triggers collapses to one run.
+- `misfire_grace_time` is configurable (default 3600s). If a job's previous run is
+  still active when its next trigger fires, the trigger is **skipped with a logged
+  notice** rather than queued.
+
 ### Crash recovery / idempotent resume
-- On startup: any `job_run` left `running` → `interrupted`; its `claimed`/`scanning`
-  tasks → `pending`. The next run (or an immediate resume) re-processes pending
-  tasks; §3 makes already-done work a cheap skip. No duplication, no lost progress.
-- Cancellation: `POST /api/runs/:id/cancel` sets the run `cancelling`; the
-  orchestrator stops dispatching, lets in-flight workers finish (or terminates
-  them), marks the run `cancelled`.
+- On startup: any `job_run` left `running` → `interrupted`; its `scanning` tasks →
+  `pending`. The next run (or an immediate resume) re-processes pending tasks; §3
+  makes already-done work a cheap skip. No duplication, no lost progress.
 
 ---
 
@@ -308,23 +370,26 @@ CREATE TABLE job_runs (
     files_scanned      INTEGER NOT NULL DEFAULT 0,
     files_skipped      INTEGER NOT NULL DEFAULT 0,
     files_corrupt      INTEGER NOT NULL DEFAULT 0,
-    files_error        INTEGER NOT NULL DEFAULT 0,
+    files_unreadable   INTEGER NOT NULL DEFAULT 0,   -- transient failures exhausted
     error_message      TEXT
 );
 CREATE INDEX ix_job_runs_job ON job_runs(job_id, started_at);
 
 -- Durable per-file queue rows for a run
 CREATE TABLE scan_tasks (
-    id           INTEGER PRIMARY KEY,
-    job_run_id   INTEGER NOT NULL REFERENCES job_runs(id) ON DELETE CASCADE,
-    path         TEXT NOT NULL,
-    status       TEXT NOT NULL DEFAULT 'pending',  -- pending|scanning|done|skipped|failed
-    skip_reason  TEXT,                             -- unchanged_within_ttl|hash_cached
-    result_hash  TEXT,                             -- FK-ish -> scan_results.hash
-    attempts     INTEGER NOT NULL DEFAULT 0,
-    error        TEXT,
-    updated_at   TEXT NOT NULL
+    id             INTEGER PRIMARY KEY,
+    job_run_id     INTEGER NOT NULL REFERENCES job_runs(id) ON DELETE CASCADE,
+    path           TEXT NOT NULL,
+    status         TEXT NOT NULL DEFAULT 'pending',
+                   -- pending|scanning|done|skipped|unreadable  (see §3 retries)
+    skip_reason    TEXT,          -- unchanged_within_ttl|hash_cached|too_fresh
+    result_hash    TEXT,          -- FK-ish -> scan_results.hash
+    attempts       INTEGER NOT NULL DEFAULT 0,   -- transient failures retried, §3
+    next_attempt_at TEXT,         -- backoff gate; NULL = ready now
+    error          TEXT,          -- last transient error / timeout detail
+    updated_at     TEXT NOT NULL
 );
+-- 'unreadable' = retries exhausted on a transient error/timeout (NOT corrupt).
 CREATE INDEX ix_scan_tasks_run_status ON scan_tasks(job_run_id, status);
 
 -- Path -> content mapping + scan bookkeeping
@@ -340,10 +405,13 @@ CREATE TABLE files (
 );
 CREATE INDEX ix_files_hash ON files(hash);
 
--- Content-addressed integrity verdict (the reusable cache)
+-- Content-addressed integrity verdict (the reusable cache).
+-- Only DETERMINISTIC verdicts are cached: transient error/timeout outcomes are
+-- never written here (they retry, §3). A row is reused only when BOTH
+-- detector_version AND detector_backend match current config (#7, #11).
 CREATE TABLE scan_results (
     hash             TEXT PRIMARY KEY,        -- blake3 of file content
-    status           TEXT NOT NULL CHECK (status IN ('ok','corrupt','error')),
+    status           TEXT NOT NULL CHECK (status IN ('ok','corrupt')),
     error_log        TEXT,
     detector_version INTEGER NOT NULL,
     detector_backend TEXT NOT NULL,           -- pyav | subprocess
@@ -357,7 +425,10 @@ CREATE TABLE detections (
     file_id      INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
     hash         TEXT NOT NULL,
     job_run_id   INTEGER REFERENCES job_runs(id) ON DELETE SET NULL,
-    status       TEXT NOT NULL DEFAULT 'open', -- open|acknowledged|replacing|resolved|ignored
+    status       TEXT NOT NULL DEFAULT 'open',
+                 -- open|acknowledged|replacing|resolved|ignored|needs_attention
+                 -- resolved: a later clean scan of this path cleared it (#6)
+                 -- needs_attention: replacement attempts exhausted, still corrupt
     detected_at  TEXT NOT NULL,
     resolved_at  TEXT,
     UNIQUE (file_id, hash)
@@ -393,16 +464,20 @@ CREATE TABLE file_arr_links (
     PRIMARY KEY (file_id, arr_instance_id)
 );
 
--- Re-request attempts
+-- Re-request attempts (one row per attempt; capped per detection -- §9, #6)
 CREATE TABLE replacements (
     id           INTEGER PRIMARY KEY,
     detection_id INTEGER NOT NULL REFERENCES detections(id) ON DELETE CASCADE,
+    attempt      INTEGER NOT NULL DEFAULT 1,        -- 1..max_replace_attempts
     arr_instance_id INTEGER REFERENCES arr_instances(id) ON DELETE SET NULL,
     media_type   TEXT,
     media_id     INTEGER,
     arr_file_id  INTEGER,
-    status       TEXT NOT NULL DEFAULT 'requested', -- requested|searching|grabbed|
-                                                    --   imported|failed|aborted
+    status       TEXT NOT NULL DEFAULT 'requested',
+                 -- requested|searching|grabbed|imported|verifying|
+                 --   succeeded|failed|exhausted|aborted
+                 -- verifying: re-scanning the imported file to confirm it's clean
+                 -- succeeded: re-scan came back ok   exhausted: attempts used up
     requested_at TEXT NOT NULL,
     updated_at   TEXT NOT NULL,
     notes        TEXT
@@ -453,9 +528,14 @@ When a corrupt detection has an arr link and the job has `auto_replace`:
 1. **Delete** the bad file: Sonarr `DELETE /api/v3/episodefile/:id`,
    Radarr `DELETE /api/v3/moviefile/:id`.
 2. **Search** for a replacement: `POST /api/v3/command`
-   (`EpisodeSearch` / `MoviesSearch` with the relevant id).
-3. Track lifecycle in `replacements`; fire `replacement_requested`. Optionally poll
-   arr history to advance to `grabbed`/`imported` and fire `replacement_completed`.
+   (`EpisodeSearch` / `MoviesSearch` with the relevant id). Fire `replacement_requested`.
+3. Poll arr history to advance `grabbed` → `imported`.
+4. **Verify (#6):** on import, enqueue a **targeted re-scan of the new file**.
+   - clean → `succeeded`, resolve the detection, fire `replacement_completed`.
+   - still corrupt → if `attempt < max_replace_attempts` (default 2) start the next
+     attempt at step 1; otherwise stop, mark the replacement `exhausted` and the
+     detection `needs_attention`, and notify. This closes the loop and prevents an
+     endless delete → grab-bad-release → delete cycle.
 
 **Safety:** `auto_replace` defaults **off**. A **dry-run** mode logs the intended
 delete+search without executing. Deletions are irreversible, so the UI requires an
@@ -500,8 +580,17 @@ Base: `/api`. JSON throughout.
 | GET/PUT | `/settings` | Global settings |
 | GET/PUT | `/notifications` | Channels + rules |
 | POST | `/notifications/test` | Send a test push |
+| POST | `/library/revalidate` | Re-scan against current detector (scope-previewed, rate-limited) (#7) |
 | GET | `/stats` | Dashboard aggregates |
 | GET | `/events` | **SSE** stream: run progress, task updates, new detections |
+| GET | `/metrics` | Prometheus metrics (§14a) |
+| GET | `/health` | Liveness/readiness |
+
+**Auth (#9):** all **mutating** routes (POST/PUT/DELETE — especially the
+destructive `/detections/:id/replace` and `auto_replace` config) require a shared
+secret (`X-Scanrr-Token`, from an env/k8s Secret), enforced by middleware. GET
+routes and `/health`/`/metrics` are open behind Cloudflare Zero Trust. This is
+defense-in-depth against other in-cluster callers, not a user-auth system.
 
 **Realtime:** clients subscribe to `/api/events` (SSE). The orchestrator publishes
 `run.progress`, `task.updated`, `detection.created`, `run.completed` events; the UI
@@ -515,30 +604,35 @@ Modern, dark-mode-first, shadcn/ui components. Left nav + content.
 
 | Route | View | Contents |
 |---|---|---|
-| `/` | **Dashboard** | Active runs (live progress bars), library health donut (ok/corrupt/error), recent runs, open-detection count, scan-throughput chart. |
+| `/` | **Dashboard** | Active runs (live progress bars), library health donut (ok/corrupt/unreadable), recent runs, open-detection count, scan-throughput chart. |
 | `/jobs` | **Jobs** | Cards/table of jobs: type, schedule, TTL, last run, status; Run-now, enable/disable, edit, delete. |
 | `/jobs/new`, `/jobs/:id` | **Job editor** | Type (path/arr), source config, TTL, cron builder, concurrency, `auto_replace` toggle (with warning), + run history for existing jobs. |
 | `/runs/:id` | **Run detail** | Live phase indicator, aggregate stats, streaming per-file table (path · status · skip reason · duration), cancel. |
 | `/detections` | **Corrupt files** | The triage list: path, detected date, run, status; expandable ffmpeg error log; actions: replace, acknowledge, ignore, resolve. Bulk actions. |
 | `/files` | **Files** | Searchable scan history across the library (path, hash, last scanned, verdict). |
 | `/settings` | **Settings hub** | Tabs below. |
-| `/settings/general` | General | Concurrency, hash algo, detector backend, media extensions, min size. |
+| `/settings/general` | General | Concurrency, hash algo, detector backend, media extensions, min size, stability gate, scan timeout, retry/replacement caps. |
 | `/settings/integrations` | Integrations | Sonarr/Radarr instances (add/test), path mappings editor. |
 | `/settings/notifications` | Notifications | Pushover keys, per-event toggles, batching, test button. |
 
 Design touches: live-updating progress via SSE, optimistic triage actions, empty
-states, toast on notifications, colour-coded status badges (green ok / amber error /
-red corrupt).
+states, toast on notifications, colour-coded status badges (green ok / amber
+unreadable / red corrupt).
 
 ---
 
 ## 13. Configuration & Settings
 
 Layered: **env vars** (deploy-time: DB path, media mount roots, encryption key,
-log level) → **`settings` table** (runtime-editable via UI). Notable runtime settings:
+**mutating-route shared secret**, log level) → **`settings` table** (runtime-editable
+via UI). Notable runtime settings:
 `max_scan_workers`, `hash_algorithm`, `detector_backend`, `media_extensions`,
-`min_file_size_bytes`, `corrupt_notification_mode` (batched|per_file),
-`serialize_runs`.
+`min_file_size_bytes`, `min_file_age_seconds` (stability gate, default 120),
+`max_scan_seconds` (per-file timeout, default 1800),
+`scan_max_attempts` (transient-failure retries, default 3),
+`max_replace_attempts` (default 2),
+`corrupt_notification_mode` (batched|per_file), `serialize_runs`,
+`misfire_grace_time` (default 3600).
 
 ---
 
@@ -549,10 +643,27 @@ log level) → **`settings` table** (runtime-editable via UI). Notable runtime s
 - **Media mounts read-only** — scanrr never writes to the library. The only writes
   to arr-managed files are explicit `auto_replace` deletions via the arr API.
 - **Destructive ops gated:** `auto_replace` off by default, dry-run available,
-  explicit UI confirmation, full audit trail in `replacements`.
+  explicit UI confirmation, capped attempts, full audit trail in `replacements`.
+- **In-cluster authz (#9):** mutating API routes require the `X-Scanrr-Token`
+  shared secret (§11), so a compromised/rogue pod can't trigger arr deletions even
+  inside the cluster edge.
 - **Deployment:** behind Cloudflare Zero Trust (owner-only) like the rest of the
-  homelab; no built-in auth in v1. Add a Zero Trust entry per the kube-saturn CLAUDE.md
-  workflow when deploying.
+  homelab; no built-in *user* auth in v1. Add a Zero Trust entry per the kube-saturn
+  CLAUDE.md workflow when deploying.
+
+---
+
+## 14a. Observability (#15)
+
+- **Structured logs (JSON):** every per-file decision is logged with its reason —
+  `scanned` (with verdict + duration), `skipped` (with `skip_reason`), `retry`,
+  `unreadable`, `timeout` — so "why did/didn't this file get scanned?" is
+  answerable after the fact without re-deriving it from the DB.
+- **`/metrics` (Prometheus):** counters (`files_scanned_total`,
+  `corrupt_found_total`, `replacements_total`, `scan_errors_total`), a scan-duration
+  histogram, and gauges for queue depth and active workers. Scrapeable by the
+  homelab Prometheus for dashboards/alerts.
+- **`notification_log`** remains the audit trail for outbound events.
 
 ---
 
