@@ -568,6 +568,18 @@ CREATE TABLE scan_task_subscribers (
 );
 CREATE INDEX ix_scan_task_subs_run ON scan_task_subscribers(job_run_id);
 
+-- Live intra-file decode progress for in-flight (SCANNING) tasks. Workers stream
+-- position/duration/frames over an IPC queue (workers never touch the DB); the main
+-- process persists it here and deletes the row on completion (§6).
+CREATE TABLE scan_progress (
+    task_id     INTEGER PRIMARY KEY REFERENCES scan_tasks(id) ON DELETE CASCADE,
+    position_s  REAL NOT NULL DEFAULT 0,   -- furthest decoded timestamp
+    duration_s  REAL NOT NULL DEFAULT 0,   -- total, 0 if unknown
+    frames      INTEGER NOT NULL DEFAULT 0,
+    pct         REAL,                       -- position_s/duration_s, NULL if unknown
+    updated_at  TEXT NOT NULL
+);
+
 -- Per-run, per-file ledger: every file a run touched and its disposition. Skips
 -- (which never enter the shared queue) live here too, powering the run-detail
 -- view and per-run stats.
@@ -811,6 +823,7 @@ Base: `/api`. JSON throughout.
 | GET | `/notifications` | Notification send log (`notification_log`) |
 | POST | `/library/revalidate` | Re-scan against current detector (scope-previewed, rate-limited) (#7) |
 | GET | `/stats` | Dashboard aggregates |
+| GET | `/activity` | Live feed: running jobs (progress + ETA from `run_files`) and files decoding now (per-file `pct` from `scan_progress`) |
 | GET | `/events` | **SSE** stream: run progress, task updates, new detections |
 | GET | `/metrics` | Prometheus metrics (§14a) |
 | GET | `/health` | Liveness/readiness |
