@@ -1,0 +1,617 @@
+# scanrr — Design Specification
+
+> **Status:** Draft v0.1 · **Owner:** Mark Mckessock
+> This document is the **source of truth** for scanrr's design. Code follows the
+> spec; when they disagree, update the spec first. Decisions marked
+> **[OPEN]** need a call before the affected code is written.
+
+---
+
+## 1. Overview
+
+**scanrr** periodically scans a media library for **corrupt video files** (bad
+frames, broken i-frames, bitstream errors) using ffmpeg, records results in a
+durable store, and surfaces failures through a modern web UI. It integrates with
+Sonarr/Radarr to discover library paths and to automatically re-request corrupt
+files, and it emits notifications via Pushover.
+
+The design centres on **content-addressed idempotency**: a file's integrity is a
+deterministic property of its bytes, so results are cached by content hash and
+reused across paths, runs, and restarts. A scan that fails partway through never
+re-does completed work.
+
+### Goals
+
+- Detect corrupt media reliably via full-file ffmpeg integrity checks.
+- Never re-scan unchanged content: skip via (size+mtime) fast-path, per-job TTL,
+  and cross-path content-hash dedup.
+- Survive crashes/restarts without losing progress or duplicating work.
+- Two job types: **path** (absolute directory) and **arr** (Sonarr/Radarr library).
+- Optional automatic re-request of corrupt files through Sonarr/Radarr.
+- Pushover notifications for key lifecycle events.
+- A beautiful, responsive UI for config, live scan progress, and corrupt-file triage.
+
+### Non-Goals (v1)
+
+- Transcoding / remuxing / repair of files (we detect, we don't fix bytes).
+- Multi-node distributed workers (single container, internal worker pool).
+- Auth/multi-user (deployed behind Cloudflare Zero Trust like the rest of the homelab).
+- Media types other than video (audio-only / images out of scope for v1).
+
+---
+
+## 2. Core Concepts (Domain Model)
+
+| Concept | Meaning |
+|---|---|
+| **Job** | A reusable, configurable unit of work: a source (path or arr instance) + TTL + schedule + options. Defines *what* to scan and *how often*. |
+| **Job Run** | One execution of a Job. Has discovery + scan phases and aggregate stats. |
+| **Scan Task** | One file's work item inside a run — the durable queue row. |
+| **File** | A path on disk: its current hash, size, mtime, and last-scan bookkeeping. |
+| **Scan Result** | Content-addressed (keyed by hash) ffmpeg verdict: `ok` / `corrupt` / `error`. The reusable cache. |
+| **Detection** | A corrupt file observed at a path, with remediation state (open → resolved). What the user triages. |
+| **Replacement** | An attempt to re-acquire a corrupt file via Sonarr/Radarr. |
+| **Arr Instance** | A configured Sonarr or Radarr endpoint (URL + API key). |
+| **Path Mapping** | Translates an arr-namespace path to scanrr's local mount path. |
+
+**Key invariant:** `Scan Result` is keyed by **content hash + detector version**,
+not by path. `File` maps path → hash. `Detection` maps a corrupt observation →
+remediation. This separation is what makes cross-path dedup and idempotent
+resume fall out naturally.
+
+---
+
+## 3. Scan Algorithm & Idempotency (the heart of the system)
+
+For each file discovered during a run:
+
+```
+stat = os.stat(path)
+f = files.get(path)
+
+# 1. Cheapest path — no disk read at all.
+if f and f.size == stat.size and f.mtime == stat.mtime
+       and f.last_scanned_at and (now - f.last_scanned_at) < job.ttl:
+    skip(reason="unchanged_within_ttl"); continue
+
+# 2. Content identity — one full read to hash (blake3). Much cheaper than decode.
+h = hash_file(path)                       # blake3
+
+# 3. Content-addressed cache hit — deterministic result, TTL-independent by design.
+sr = scan_results.get(h)
+if sr and sr.detector_version == CURRENT_DETECTOR_VERSION:
+    files.upsert(path, hash=h, size, mtime, last_scanned_at=now)
+    if sr.status == "corrupt": ensure_detection(path, h, run)
+    skip(reason="hash_cached"); continue      # <-- same bytes elsewhere already scanned
+
+# 4. Cache miss — the expensive full ffmpeg integrity check.
+result = ffmpeg_integrity_check(path)     # ok | corrupt | error (+ error log)
+scan_results.upsert(h, result, detector_version=CURRENT_DETECTOR_VERSION)
+files.upsert(path, hash=h, size, mtime, last_scanned_at=now)
+if result.status == "corrupt":
+    d = ensure_detection(path, h, run)
+    if job.auto_replace: enqueue_replacement(d)
+    notify("corrupt_found", ...)
+```
+
+**Why this satisfies every requirement:**
+
+- *"Don't re-scan within TTL"* → step 1 (and TTL gates the unchanged fast path).
+- *"Skip if hash unchanged"* → steps 1 & 3.
+- *"Skip if hash already recorded under a different path, even outside TTL"* →
+  step 3 skips regardless of TTL, because a hash → result is deterministic.
+- *"Idempotent if a scan fails"* → completed tasks are `done` in the DB and their
+  results are cached by hash; a re-run skips them in step 1/3. Nothing repeats.
+
+**Detector versioning:** `CURRENT_DETECTOR_VERSION` is bumped whenever the ffmpeg
+args or detection logic change. Cached results from an older detector are treated
+as misses and re-scanned — so improving detection doesn't silently trust stale verdicts.
+
+**Hashing:** [blake3](https://github.com/oconnor663/blake3-py) (multithreaded,
+far faster than sha256; the NFS read is the real bottleneck on large remuxes).
+Configurable to sha256. Step 1's (size, mtime) fast-path avoids even reading the
+file on the common "nothing changed" case. **[OPEN]** blake3 vs sha256 default —
+blake3 recommended.
+
+---
+
+## 4. Tech Stack
+
+### Backend
+- **Python 3.12**, **FastAPI** + **Uvicorn** (async orchestrator + REST + SSE).
+- **PyAV** (libav bindings, in-process) as the primary integrity checker — honours
+  the "prefer bindings over shelling out" preference. **subprocess ffmpeg** kept as
+  a configurable fallback (§7).
+- **blake3** for content hashing.
+- **SQLModel** (SQLAlchemy 2.x core + Pydantic models) over **SQLite** (WAL mode).
+- **Alembic** for migrations.
+- **APScheduler** for cron-based job scheduling.
+- **httpx** for Sonarr/Radarr and Pushover clients.
+- **ProcessPoolExecutor** for the CPU-bound scan workers (§6).
+
+### Frontend
+- **React 18 + TypeScript + Vite**.
+- **Tailwind CSS** + **shadcn/ui** (Radix primitives) for a clean, modern look.
+- **TanStack Query** for server state; **React Router** for routing.
+- **Recharts** for dashboard charts; **lucide-react** icons.
+- **Server-Sent Events (SSE)** for live scan/run progress (one-directional, simpler
+  than WebSockets and a perfect fit).
+
+### Packaging / Ops
+- Single **multi-stage Docker image**: build frontend → serve static assets from
+  FastAPI, one container.
+- Deployed to the **kube-saturn** cluster via Flux; SQLite on a **PVC**
+  (volsync-backed), media mounted **read-only** (NFS from Synology).
+- Tooling: **uv** (Python), **pnpm** (frontend), **ruff** + **mypy** + **pytest**,
+  **vitest** + **Playwright** (frontend).
+
+---
+
+## 5. Architecture
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│ scanrr container (single process, single SQLite writer)        │
+│                                                                │
+│  FastAPI ──┬── REST API  (/api/*)                              │
+│            └── SSE        (/api/events)                         │
+│                                                                │
+│  APScheduler ── triggers Jobs on cron → creates Job Runs       │
+│                                                                │
+│  Orchestrator (async, main process = SOLE DB WRITER)           │
+│    • discovery: enumerate files → insert scan_tasks (durable)  │
+│    • pre-checks: TTL / hash-cache lookups (skip cheaply)       │
+│    • dispatch: submit pending tasks to the pool (bounded)      │
+│    • collect: write results, create detections, notify         │
+│                                                                │
+│  ProcessPoolExecutor  (N workers, pure CPU, NO DB access)      │
+│    worker(path) -> (hash, status, error_log, duration_ms)      │
+│         └── blake3 hash + PyAV decode-all-frames               │
+│                                                                │
+│  Integrations:  Sonarr/Radarr (httpx) · Pushover (httpx)       │
+└──────────────────────────────────────────────────────────────┘
+        │ read-only NFS mounts            │ PVC
+        ▼                                 ▼
+   Synology media shares            scanrr.db (SQLite/WAL)
+```
+
+**Single-writer design.** Only the main process touches SQLite. Worker processes
+are pure functions returning results; the orchestrator performs all reads/writes.
+This sidesteps multi-process SQLite write contention entirely while still getting
+true parallelism for the heavy decode work.
+
+---
+
+## 6. Job Queue & Concurrency Model
+
+**The database is the queue.** `scan_tasks` rows are durable work items; the queue
+survives restarts.
+
+### Lifecycle of a run
+1. **Trigger** — scheduler (cron) or manual (`POST /api/jobs/:id/run`) creates a
+   `job_run` (`queued`).
+2. **Discovery** — orchestrator resolves the source to a file list (walk dir, or
+   query arr + apply path mappings), inserting one `scan_task` (`pending`) per file.
+   Run → `running`.
+3. **Pre-check & dispatch** — orchestrator streams pending tasks, applies §3 steps
+   1–3 (cheap skips need no worker), and submits real work to the pool up to the
+   concurrency limit (backpressure = bounded in-flight futures).
+4. **Collect** — as futures resolve, the orchestrator writes `scan_results`,
+   updates `files`, creates `detections`, enqueues replacements, fires notifications,
+   and advances `scan_task` state.
+5. **Finalize** — when all tasks are terminal, aggregate stats onto `job_run`,
+   set `completed`/`failed`, fire `scan_completed`.
+
+### Concurrency
+- Global `max_scan_workers` (default **3**) and optional per-job override. Scanning
+  is **NFS-read-bandwidth bound**, not CPU bound — too many parallel decodes thrash
+  the network share, so the default is deliberately low. Documented in Settings.
+- Hashing and decoding both run in worker processes (true parallelism; both release
+  the GIL / run out-of-process).
+- **[OPEN]** Whether two different Jobs may run concurrently, or runs are globally
+  serialized with a shared worker pool. *Recommended:* one active run at a time in
+  v1 (simpler, avoids double-scanning overlapping paths); queue additional triggers.
+
+### Crash recovery / idempotent resume
+- On startup: any `job_run` left `running` → `interrupted`; its `claimed`/`scanning`
+  tasks → `pending`. The next run (or an immediate resume) re-processes pending
+  tasks; §3 makes already-done work a cheap skip. No duplication, no lost progress.
+- Cancellation: `POST /api/runs/:id/cancel` sets the run `cancelling`; the
+  orchestrator stops dispatching, lets in-flight workers finish (or terminates
+  them), marks the run `cancelled`.
+
+---
+
+## 7. FFmpeg Integrity Checking
+
+**Primary — PyAV (in-process libav bindings):** open the container with aggressive
+error detection, demux every packet, and decode every frame of every stream,
+collecting `av.AVError`s.
+
+```python
+import av
+
+def ffmpeg_integrity_check(path: str) -> ScanOutcome:
+    errors: list[str] = []
+    try:
+        container = av.open(path, options={"err_detect": "aggressive"})
+    except av.AVError as e:
+        return ScanOutcome("error", log=f"open failed: {e}")   # unreadable/not media
+    try:
+        for packet in container.demux():          # video + audio streams
+            try:
+                for _frame in packet.decode():
+                    pass                            # decoding is the integrity test
+            except av.AVError as e:
+                errors.append(str(e))
+    except av.AVError as e:
+        errors.append(str(e))
+    finally:
+        container.close()
+    return ScanOutcome("corrupt", log="\n".join(errors)) if errors \
+        else ScanOutcome("ok")
+```
+
+- Full decode of all frames is what actually catches bad i-frames / bitstream rot.
+- `err_detect=aggressive` mirrors the reference CLI behaviour.
+- **Statuses:** `ok` (clean), `corrupt` (decoded but with frame errors),
+  `error` (couldn't open/demux — likely truncated or not a video).
+
+**Fallback — subprocess** (config `detector_backend: pyav | subprocess`), for
+codecs/builds where PyAV misbehaves:
+`ffmpeg -v error -err_detect aggressive -i <file> -f null -` → nonzero exit or
+stderr = corrupt. Same `ScanOutcome` shape either way.
+
+**Discovery filter:** configurable media extensions
+(`.mkv .mp4 .avi .m4v .ts .mov .wmv .flv .webm .mpg .mpeg .m2ts` …) and a minimum
+file size, to skip samples/artwork/subtitles.
+
+---
+
+## 8. Database Schema
+
+SQLite, WAL mode, `busy_timeout=5000`, foreign keys on. DDL is indicative; Alembic
+owns the canonical migrations.
+
+```sql
+-- Global key/value config (concurrency, hash algo, detector backend, ext list…)
+CREATE TABLE settings (
+    key         TEXT PRIMARY KEY,
+    value       TEXT NOT NULL,               -- JSON-encoded
+    updated_at  TEXT NOT NULL
+);
+
+-- Job definitions
+CREATE TABLE jobs (
+    id            INTEGER PRIMARY KEY,
+    name          TEXT NOT NULL,
+    type          TEXT NOT NULL CHECK (type IN ('path','arr')),
+    enabled       INTEGER NOT NULL DEFAULT 1,
+    ttl_seconds   INTEGER NOT NULL,          -- rescan window
+    schedule_cron TEXT,                      -- NULL = manual only
+    config        TEXT NOT NULL,             -- JSON: {root_path} | {arr_instance_id}
+    concurrency   INTEGER,                   -- NULL = use global default
+    auto_replace  INTEGER NOT NULL DEFAULT 0,
+    created_at    TEXT NOT NULL,
+    updated_at    TEXT NOT NULL
+);
+
+-- One execution of a job
+CREATE TABLE job_runs (
+    id                 INTEGER PRIMARY KEY,
+    job_id             INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    status             TEXT NOT NULL           -- queued|running|completed|failed|
+                       DEFAULT 'queued',       --   cancelling|cancelled|interrupted
+    trigger            TEXT NOT NULL,           -- manual | scheduled
+    started_at         TEXT,
+    finished_at        TEXT,
+    files_discovered   INTEGER NOT NULL DEFAULT 0,
+    files_scanned      INTEGER NOT NULL DEFAULT 0,
+    files_skipped      INTEGER NOT NULL DEFAULT 0,
+    files_corrupt      INTEGER NOT NULL DEFAULT 0,
+    files_error        INTEGER NOT NULL DEFAULT 0,
+    error_message      TEXT
+);
+CREATE INDEX ix_job_runs_job ON job_runs(job_id, started_at);
+
+-- Durable per-file queue rows for a run
+CREATE TABLE scan_tasks (
+    id           INTEGER PRIMARY KEY,
+    job_run_id   INTEGER NOT NULL REFERENCES job_runs(id) ON DELETE CASCADE,
+    path         TEXT NOT NULL,
+    status       TEXT NOT NULL DEFAULT 'pending',  -- pending|scanning|done|skipped|failed
+    skip_reason  TEXT,                             -- unchanged_within_ttl|hash_cached
+    result_hash  TEXT,                             -- FK-ish -> scan_results.hash
+    attempts     INTEGER NOT NULL DEFAULT 0,
+    error        TEXT,
+    updated_at   TEXT NOT NULL
+);
+CREATE INDEX ix_scan_tasks_run_status ON scan_tasks(job_run_id, status);
+
+-- Path -> content mapping + scan bookkeeping
+CREATE TABLE files (
+    id               INTEGER PRIMARY KEY,
+    path             TEXT NOT NULL UNIQUE,
+    hash             TEXT,                    -- current content hash (blake3)
+    size_bytes       INTEGER,
+    mtime            REAL,
+    first_seen_at    TEXT NOT NULL,
+    last_seen_at     TEXT NOT NULL,
+    last_scanned_at  TEXT
+);
+CREATE INDEX ix_files_hash ON files(hash);
+
+-- Content-addressed integrity verdict (the reusable cache)
+CREATE TABLE scan_results (
+    hash             TEXT PRIMARY KEY,        -- blake3 of file content
+    status           TEXT NOT NULL CHECK (status IN ('ok','corrupt','error')),
+    error_log        TEXT,
+    detector_version INTEGER NOT NULL,
+    detector_backend TEXT NOT NULL,           -- pyav | subprocess
+    scan_duration_ms INTEGER,
+    scanned_at       TEXT NOT NULL
+);
+
+-- A corrupt file observed at a path, with remediation state
+CREATE TABLE detections (
+    id           INTEGER PRIMARY KEY,
+    file_id      INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+    hash         TEXT NOT NULL,
+    job_run_id   INTEGER REFERENCES job_runs(id) ON DELETE SET NULL,
+    status       TEXT NOT NULL DEFAULT 'open', -- open|acknowledged|replacing|resolved|ignored
+    detected_at  TEXT NOT NULL,
+    resolved_at  TEXT,
+    UNIQUE (file_id, hash)
+);
+CREATE INDEX ix_detections_status ON detections(status);
+
+-- Sonarr/Radarr endpoints
+CREATE TABLE arr_instances (
+    id         INTEGER PRIMARY KEY,
+    type       TEXT NOT NULL CHECK (type IN ('sonarr','radarr')),
+    name       TEXT NOT NULL,
+    base_url   TEXT NOT NULL,
+    api_key    TEXT NOT NULL,                 -- encrypted at rest (§14)
+    enabled    INTEGER NOT NULL DEFAULT 1,
+    created_at TEXT NOT NULL
+);
+
+-- arr-namespace path -> scanrr local mount path (longest-prefix match)
+CREATE TABLE path_mappings (
+    id               INTEGER PRIMARY KEY,
+    arr_instance_id  INTEGER NOT NULL REFERENCES arr_instances(id) ON DELETE CASCADE,
+    remote_path      TEXT NOT NULL,           -- e.g. /data/media/tv
+    local_path       TEXT NOT NULL            -- e.g. /mnt/tv
+);
+
+-- Links a scanned file to its arr media item (populated during arr discovery)
+CREATE TABLE file_arr_links (
+    file_id          INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+    arr_instance_id  INTEGER NOT NULL REFERENCES arr_instances(id) ON DELETE CASCADE,
+    media_type       TEXT NOT NULL,           -- episode | movie
+    media_id         INTEGER NOT NULL,        -- series/episode or movie id
+    arr_file_id      INTEGER NOT NULL,        -- episodeFile / movieFile id
+    PRIMARY KEY (file_id, arr_instance_id)
+);
+
+-- Re-request attempts
+CREATE TABLE replacements (
+    id           INTEGER PRIMARY KEY,
+    detection_id INTEGER NOT NULL REFERENCES detections(id) ON DELETE CASCADE,
+    arr_instance_id INTEGER REFERENCES arr_instances(id) ON DELETE SET NULL,
+    media_type   TEXT,
+    media_id     INTEGER,
+    arr_file_id  INTEGER,
+    status       TEXT NOT NULL DEFAULT 'requested', -- requested|searching|grabbed|
+                                                    --   imported|failed|aborted
+    requested_at TEXT NOT NULL,
+    updated_at   TEXT NOT NULL,
+    notes        TEXT
+);
+
+-- Notification config + audit
+CREATE TABLE notification_channels (
+    id       INTEGER PRIMARY KEY,
+    type     TEXT NOT NULL DEFAULT 'pushover',
+    config   TEXT NOT NULL,                   -- JSON {user_key, api_token, priority} (encrypted)
+    enabled  INTEGER NOT NULL DEFAULT 1
+);
+CREATE TABLE notification_rules (
+    channel_id INTEGER NOT NULL REFERENCES notification_channels(id) ON DELETE CASCADE,
+    event_type TEXT NOT NULL,     -- scan_started|scan_completed|corrupt_found|
+                                  --   replacement_requested|replacement_completed|job_failed
+    enabled    INTEGER NOT NULL DEFAULT 1,
+    PRIMARY KEY (channel_id, event_type)
+);
+CREATE TABLE notification_log (
+    id          INTEGER PRIMARY KEY,
+    event_type  TEXT NOT NULL,
+    channel_id  INTEGER REFERENCES notification_channels(id) ON DELETE SET NULL,
+    payload     TEXT,
+    status      TEXT NOT NULL,               -- sent | failed
+    error       TEXT,
+    created_at  TEXT NOT NULL
+);
+```
+
+---
+
+## 9. Sonarr / Radarr Integration
+
+### Discovery (arr-type jobs)
+- **Sonarr** (API v3): enumerate `GET /api/v3/series` → per series
+  `GET /api/v3/episodefile?seriesId=…`; collect `episodeFile.path`, `episodeFileId`,
+  episode id. **Radarr:** `GET /api/v3/movie` → `movieFile.path`, `movieFileId`,
+  movie id.
+- **Path mapping:** arr returns paths in *its* namespace. Apply the longest-prefix
+  `path_mappings` rule for that instance to translate to scanrr's local mount, then
+  scan as usual. Record the arr linkage in `file_arr_links` so remediation is possible.
+- Files that don't match any mapping (or aren't present on the mount) are flagged as
+  discovery warnings, not scanned.
+
+### Auto-replacement (destructive — opt-in per job)
+When a corrupt detection has an arr link and the job has `auto_replace`:
+1. **Delete** the bad file: Sonarr `DELETE /api/v3/episodefile/:id`,
+   Radarr `DELETE /api/v3/moviefile/:id`.
+2. **Search** for a replacement: `POST /api/v3/command`
+   (`EpisodeSearch` / `MoviesSearch` with the relevant id).
+3. Track lifecycle in `replacements`; fire `replacement_requested`. Optionally poll
+   arr history to advance to `grabbed`/`imported` and fire `replacement_completed`.
+
+**Safety:** `auto_replace` defaults **off**. A **dry-run** mode logs the intended
+delete+search without executing. Deletions are irreversible, so the UI requires an
+explicit toggle and shows a clear warning. **[OPEN]** dry-run default on first enable?
+
+---
+
+## 10. Notifications (Pushover)
+
+Events: `scan_started`, `scan_completed` (with summary counts),
+`corrupt_found`, `replacement_requested`, `replacement_completed`, `job_failed`.
+
+- Per-channel, per-event toggles (`notification_rules`); every send audited in
+  `notification_log`.
+- **Anti-spam:** `corrupt_found` is **batched** — a run summarises new detections in
+  the `scan_completed` message rather than firing one push per bad file (a single
+  run can surface dozens). A per-file push is available behind a setting for small libraries.
+- Provider abstracted behind a `NotificationChannel` interface so more backends
+  (ntfy, Discord, …) can be added later without schema churn.
+
+---
+
+## 11. REST API & Realtime
+
+Base: `/api`. JSON throughout.
+
+| Method | Route | Purpose |
+|---|---|---|
+| GET/POST | `/jobs` | List / create jobs |
+| GET/PUT/DELETE | `/jobs/:id` | Read / update / delete a job |
+| POST | `/jobs/:id/run` | Trigger a run now |
+| GET | `/runs` · `/runs/:id` | Run history / detail + stats |
+| POST | `/runs/:id/cancel` | Cancel a running job |
+| GET | `/runs/:id/tasks` | Per-file task state (paged) |
+| GET | `/detections` | Corrupt files (filter by status) |
+| POST | `/detections/:id/replace` | Manually request replacement |
+| POST | `/detections/:id/acknowledge` · `/ignore` · `/resolve` | Triage transitions |
+| GET | `/files` | Search scanned files (path/hash/status) |
+| GET/POST | `/arr-instances` · `/arr-instances/:id` | Manage arr endpoints |
+| POST | `/arr-instances/:id/test` | Connection test |
+| GET/POST/DELETE | `/path-mappings` | Manage path mappings |
+| GET/PUT | `/settings` | Global settings |
+| GET/PUT | `/notifications` | Channels + rules |
+| POST | `/notifications/test` | Send a test push |
+| GET | `/stats` | Dashboard aggregates |
+| GET | `/events` | **SSE** stream: run progress, task updates, new detections |
+
+**Realtime:** clients subscribe to `/api/events` (SSE). The orchestrator publishes
+`run.progress`, `task.updated`, `detection.created`, `run.completed` events; the UI
+updates live without polling. TanStack Query caches are invalidated on relevant events.
+
+---
+
+## 12. UI Views & Routes
+
+Modern, dark-mode-first, shadcn/ui components. Left nav + content.
+
+| Route | View | Contents |
+|---|---|---|
+| `/` | **Dashboard** | Active runs (live progress bars), library health donut (ok/corrupt/error), recent runs, open-detection count, scan-throughput chart. |
+| `/jobs` | **Jobs** | Cards/table of jobs: type, schedule, TTL, last run, status; Run-now, enable/disable, edit, delete. |
+| `/jobs/new`, `/jobs/:id` | **Job editor** | Type (path/arr), source config, TTL, cron builder, concurrency, `auto_replace` toggle (with warning), + run history for existing jobs. |
+| `/runs/:id` | **Run detail** | Live phase indicator, aggregate stats, streaming per-file table (path · status · skip reason · duration), cancel. |
+| `/detections` | **Corrupt files** | The triage list: path, detected date, run, status; expandable ffmpeg error log; actions: replace, acknowledge, ignore, resolve. Bulk actions. |
+| `/files` | **Files** | Searchable scan history across the library (path, hash, last scanned, verdict). |
+| `/settings` | **Settings hub** | Tabs below. |
+| `/settings/general` | General | Concurrency, hash algo, detector backend, media extensions, min size. |
+| `/settings/integrations` | Integrations | Sonarr/Radarr instances (add/test), path mappings editor. |
+| `/settings/notifications` | Notifications | Pushover keys, per-event toggles, batching, test button. |
+
+Design touches: live-updating progress via SSE, optimistic triage actions, empty
+states, toast on notifications, colour-coded status badges (green ok / amber error /
+red corrupt).
+
+---
+
+## 13. Configuration & Settings
+
+Layered: **env vars** (deploy-time: DB path, media mount roots, encryption key,
+log level) → **`settings` table** (runtime-editable via UI). Notable runtime settings:
+`max_scan_workers`, `hash_algorithm`, `detector_backend`, `media_extensions`,
+`min_file_size_bytes`, `corrupt_notification_mode` (batched|per_file),
+`serialize_runs`.
+
+---
+
+## 14. Security & Safety
+
+- **Secrets at rest:** arr API keys and Pushover tokens encrypted with a key from
+  env/k8s Secret (Fernet). Never returned in plaintext by the API.
+- **Media mounts read-only** — scanrr never writes to the library. The only writes
+  to arr-managed files are explicit `auto_replace` deletions via the arr API.
+- **Destructive ops gated:** `auto_replace` off by default, dry-run available,
+  explicit UI confirmation, full audit trail in `replacements`.
+- **Deployment:** behind Cloudflare Zero Trust (owner-only) like the rest of the
+  homelab; no built-in auth in v1. Add a Zero Trust entry per the kube-saturn CLAUDE.md
+  workflow when deploying.
+
+---
+
+## 15. Deployment
+
+- Multi-stage Dockerfile (pnpm build frontend → copy into Python image → uvicorn).
+- k8s (kube-saturn / Flux): Deployment + Service + PVC (SQLite, volsync-backed) +
+  read-only NFS media mounts + Cloudflare tunnel ingress + Zero Trust policy.
+  ffmpeg/libav provided by the base image (PyAV wheels bundle libav, or install ffmpeg).
+- Single replica (SQLite writer + in-process scheduler are not HA); liveness/readiness
+  on `/api/health`.
+
+---
+
+## 16. Repository Layout
+
+```
+scanrr/
+├── SPEC.md                 # this document (source of truth)
+├── README.md
+├── backend/
+│   ├── pyproject.toml
+│   ├── alembic/
+│   └── scanrr/
+│       ├── main.py         # FastAPI app + lifespan (scheduler, orchestrator)
+│       ├── api/            # routers
+│       ├── core/           # config, settings, security, events (SSE bus)
+│       ├── db/             # engine, session, models (SQLModel)
+│       ├── scanning/       # hashing, ffmpeg integrity, worker fn, orchestrator
+│       ├── jobs/           # discovery (path, arr), scheduler, queue
+│       └── integrations/   # sonarr, radarr, pushover clients
+├── frontend/
+│   ├── package.json
+│   └── src/                # React app (routes, components, api client, sse)
+└── deploy/
+    ├── Dockerfile
+    └── k8s/                # or a reference into kube-saturn
+```
+
+---
+
+## 17. Open Questions
+
+1. blake3 vs sha256 as the default hash. *(rec: blake3)*
+2. Allow concurrent runs across different jobs, or serialize globally? *(rec: serialize v1)*
+3. Dry-run auto-replace on first enable by default?
+4. Poll arr history to confirm `replacement_completed`, or fire-and-forget at request?
+5. Per-file vs batched `corrupt_found` default. *(rec: batched)*
+
+---
+
+## 18. Milestones
+
+- **M1 — Core scan engine:** SQLite schema, path jobs, blake3 + PyAV integrity,
+  content-addressed idempotency, manual run, minimal run/detection API. CLI-testable.
+- **M2 — Scheduling & queue:** APScheduler, durable `scan_tasks` queue, worker pool,
+  crash recovery, TTL fast-path.
+- **M3 — UI:** dashboard, jobs, run detail (live SSE), detections triage, settings.
+- **M4 — Arr integration:** discovery + path mapping, `file_arr_links`, manual replace.
+- **M5 — Auto-replace & notifications:** opt-in re-request lifecycle, Pushover events.
+- **M6 — Deploy:** Docker image, kube-saturn manifests, Zero Trust, volsync PVC.
