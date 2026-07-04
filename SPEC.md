@@ -147,7 +147,9 @@ change) or via an explicit, scope-previewed **"Revalidate library"** action.
 The (size, mtime) fast-path (step 1) avoids reading the file at all on the common
 "nothing changed" case. The extra full read on a cache miss (#2) is an accepted
 cost — decided in favour of simple, exact whole-file dedup over a partial
-signature. **[OPEN]** blake3 vs sha256 default — blake3 recommended.
+signature. **Decided:** blake3 (multi-core headroom for local/cached scans, no
+adversary to need SHA's standardisation); NFS read dominates so the choice is
+low-stakes. `hash_algorithm` remains configurable to sha256.
 
 ---
 
@@ -707,7 +709,7 @@ scanrr/
 
 ## 17. Open Questions
 
-1. blake3 vs sha256 as the default hash. *(rec: blake3)*
+1. ~~blake3 vs sha256 as the default hash.~~ **Decided: blake3** (configurable to sha256).
 2. Allow concurrent runs across different jobs, or serialize globally? *(rec: serialize v1)*
 3. Dry-run auto-replace on first enable by default?
 4. Poll arr history to confirm `replacement_completed`, or fire-and-forget at request?
