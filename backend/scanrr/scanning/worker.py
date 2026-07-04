@@ -30,6 +30,7 @@ def decode(
     *,
     task_id: int | None = None,
     progress_q: ProgressSink | None = None,
+    threads: int = 1,
 ) -> Outcome:
     """Run the integrity check (the expensive decode). Runs in a worker process;
     if given a progress queue, streams live decode progress back to the parent."""
@@ -39,4 +40,4 @@ def decode(
         def on_progress(position_s: float, duration_s: float, frames: int) -> None:
             progress_q.put((task_id, position_s, duration_s, frames))
 
-    return integrity.check(path, backend=backend, on_progress=on_progress)
+    return integrity.check(path, backend=backend, on_progress=on_progress, threads=threads)

@@ -53,7 +53,7 @@ async def lifespan(app: FastAPI):
     bus = EventBus()
     orchestrator = Orchestrator(
         db,
-        PebbleExecutor(fc.config.max_scan_workers),
+        PebbleExecutor(fc.config.max_scan_workers, fc.config.decode_threads),
         fc.config,
         bus=bus,
         yaml_jobs=yaml_registry,

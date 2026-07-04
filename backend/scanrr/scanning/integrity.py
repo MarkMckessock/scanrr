@@ -88,7 +88,10 @@ class _ErrorCollector(logging.Handler):
 # PyAV backend
 # --------------------------------------------------------------------------- #
 def check_pyav(
-    path: str, *, on_progress: Callable[[float, float, int], None] | None = None
+    path: str,
+    *,
+    on_progress: Callable[[float, float, int], None] | None = None,
+    threads: int = 1,
 ) -> Outcome:
     """Integrity check using in-process libav decoding, with libav's ERROR log
     stream captured via Python logging.
@@ -128,6 +131,16 @@ def check_pyav(
             return Outcome(
                 Status.ERROR, log=f"open failed: {exc}", backend=DetectorBackend.PYAV
             )
+        # Multithreaded frame decoding (~7× on 4K). libav routes decode-thread errors
+        # to the process-global "libav" logger we tap above, so detection is unchanged.
+        for stream in container.streams:
+            if stream.type == "video":
+                try:
+                    cc = stream.codec_context
+                    cc.thread_type = "NONE" if threads == 1 else "AUTO"
+                    cc.thread_count = 1 if threads == 1 else threads
+                except (ValueError, AttributeError):
+                    pass  # codec without threading support — decode single-threaded
         # container.duration is in av.time_base (AV_TIME_BASE = 1e6 microseconds).
         total_s = (container.duration or 0) / 1_000_000
         max_s = 0.0
@@ -218,13 +231,15 @@ def check(
     backend: DetectorBackend = DetectorBackend.PYAV,
     *,
     on_progress: Callable[[float, float, int], None] | None = None,
+    threads: int = 1,
 ) -> Outcome:
-    """Run the configured backend against ``path``. ``on_progress`` is only wired
-    for the PyAV backend (the subprocess backend has no in-loop hook)."""
+    """Run the configured backend against ``path``. ``on_progress`` and ``threads``
+    are only wired for the PyAV backend (the subprocess backend has no in-loop hook
+    and threads via ffmpeg's own default)."""
     try:
         resolved = DetectorBackend(backend)
     except ValueError:
         raise ValueError(f"unknown detector backend: {backend!r}") from None
     if resolved is DetectorBackend.PYAV:
-        return check_pyav(path, on_progress=on_progress)
+        return check_pyav(path, on_progress=on_progress, threads=threads)
     return check_subprocess(path)

@@ -57,6 +57,16 @@ def test_unknown_duration_leaves_pct_none(tmp_path):
 
 
 @requires_ffmpeg
+def test_multithreaded_decode_matches_single_thread(media):
+    """Threaded decode must produce the SAME verdict as single-threaded — libav
+    routes decode-thread errors to the process-global logger we tap (fidelity)."""
+    for key in ("clean", "bitflip"):
+        single = integrity.check_pyav(str(media[key]), threads=1)
+        threaded = integrity.check_pyav(str(media[key]), threads=4)
+        assert single.status is threaded.status
+
+
+@requires_ffmpeg
 def test_check_pyav_invokes_progress_callback(media):
     calls: list[tuple[float, float, int]] = []
 

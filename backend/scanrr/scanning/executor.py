@@ -43,8 +43,9 @@ class InlineExecutor:
     """Runs in-process on the event loop thread. For the CLI and unit tests;
     ``timeout`` is not enforced (use the pool for real timeouts)."""
 
-    def __init__(self) -> None:
+    def __init__(self, decode_threads: int = 1) -> None:
         self._progress: list[ProgressUpdate] = []
+        self._decode_threads = decode_threads
 
     async def hash(self, path: str, algorithm: HashAlgorithm) -> str:
         return hash_file(path, algorithm)
@@ -58,7 +59,9 @@ class InlineExecutor:
             def on_progress(pos: float, dur: float, frames: int, _tid: int = task_id) -> None:
                 self._progress.append(ProgressUpdate(_tid, pos, dur, frames))
 
-        return integrity.check(path, backend=backend, on_progress=on_progress)
+        return integrity.check(
+            path, backend=backend, on_progress=on_progress, threads=self._decode_threads
+        )
 
     def poll_progress(self) -> list[ProgressUpdate]:
         out, self._progress = self._progress, []
@@ -73,7 +76,7 @@ class PebbleExecutor:
     per-decode timeout that terminates the worker, and cancellation. A manager
     queue carries live decode progress from the workers back to the main process."""
 
-    def __init__(self, max_workers: int) -> None:
+    def __init__(self, max_workers: int, decode_threads: int = 1) -> None:
         from multiprocessing import Manager
 
         from pebble import ProcessPool
@@ -81,6 +84,7 @@ class PebbleExecutor:
         self._pool = ProcessPool(max_workers=max_workers)
         self._manager = Manager()
         self._progress_q = self._manager.Queue()
+        self._decode_threads = decode_threads
 
     async def hash(self, path: str, algorithm: HashAlgorithm) -> str:
         future = self._pool.schedule(hash_file, args=[path, algorithm])
@@ -96,7 +100,11 @@ class PebbleExecutor:
         future = self._pool.schedule(
             worker.decode,
             args=[path, backend],
-            kwargs={"task_id": task_id, "progress_q": self._progress_q},
+            kwargs={
+                "task_id": task_id,
+                "progress_q": self._progress_q,
+                "threads": self._decode_threads,
+            },
             timeout=timeout,
         )
         try:

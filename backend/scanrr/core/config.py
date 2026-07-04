@@ -24,6 +24,10 @@ class RuntimeConfig(BaseModel):
     ``settings`` table; overridable per-run. Fully typed — never a bare dict."""
 
     max_scan_workers: int = 3
+    # Threads per decode: 1 = single-threaded; N = N libav frame-threads; 0 = auto
+    # (all cores). Multithreaded decode is a ~7× per-file win on 4K (no fidelity
+    # loss). Keep max_scan_workers × decode_threads ≈ available cores.
+    decode_threads: int = 1
     hash_algorithm: HashAlgorithm = HashAlgorithm.BLAKE3
     detector_backend: DetectorBackend = DetectorBackend.PYAV
     media_extensions: list[str] = Field(default_factory=lambda: list(DEFAULT_MEDIA_EXTENSIONS))

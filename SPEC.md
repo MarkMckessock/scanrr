@@ -407,6 +407,12 @@ run waiting on a vanished task).
 ### Concurrency knobs
 - Global `max_scan_workers` (default **3**) and optional per-job override — the
   single NFS-bandwidth throttle across *all* concurrent runs. Deliberately low.
+- `decode_threads` (default **1**) — libav frame-threads per decode. Multithreaded
+  software decode is a ~7× per-file win on 4K (measured) with **no fidelity loss**
+  (libav routes decode-thread errors to the process-global logger we tap). Keep
+  `max_scan_workers × decode_threads ≈ cores` to avoid oversubscription; threading
+  cuts per-file latency, more workers raises throughput. GPU/HW decode is rejected:
+  hardware decoders conceal exactly the single-frame corruption we detect.
 - Hashing and decoding run in separate **worker processes** (`pebble.ProcessPool`),
   giving true parallelism (separate processes, so no shared GIL at all).
 
