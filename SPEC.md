@@ -121,20 +121,34 @@ for path in discover(job):
     record(run, path, "queued", task)
 ```
 
-**Phase B — worker (once per shared task, result fanned out to all subscribers):**
+**Phase B — worker (once per shared task, result fanned out to all subscribers).**
+The dispatcher (§6) claims the next `pending` task by `seq`, marks it `scanning`,
+and runs the worker. `fan_out(task, outcome)` is the single place every subscribed
+run is credited — it exists so `ok`, `corrupt`, and `unreadable` all converge on
+the same accounting, which is what guarantees runs always finalize (§6).
 ```
-result = ffmpeg_integrity_check(task.path, timeout=max_scan_seconds)   # §6, §7
-if result.status in ("ok", "corrupt"):                    # deterministic verdicts only
+task = claim_next_pending()                # by seq; task.status = "scanning"
+result = ffmpeg_integrity_check(task.path, timeout=max_scan_seconds)   # §7
+
+if result.status in ("ok", "corrupt"):     # deterministic verdict
     scan_results.upsert(task.content_hash, result, DETECTOR_VERSION, DETECTOR_BACKEND)
     files.upsert(task.path, hash=task.content_hash, last_scanned_at=now)
-    task.status = "done"
+    task.status, task.result_status = "done", result.status
     detection = reconcile_detections(task.path, task.content_hash, result.status)
-    for run in subscribers(task):                         # fan-out
-        set_outcome(run, task.path, result.status)
-        if result.status == "corrupt" and run.job.auto_replace:
+    if result.status == "corrupt":
+        enqueue_notification("corrupt_found", path=task.path)   # §10 queue
+    fan_out(task, result.status)
+else:                                       # error / timeout = TRANSIENT
+    retry_or_fail(task)                     # NOT cached; back to 'pending' w/ backoff...
+    if task.status == "unreadable":         # ...until scan_max_attempts exhausted
+        fan_out(task, "unreadable")
+
+def fan_out(task, outcome):                 # credit EVERY subscribed run
+    for run in subscribers(task):
+        set_outcome(run, task.path, outcome)             # run_files.outcome
+        if outcome == "corrupt" and run.job.auto_replace:
             propose_replacement(detection, run.job)       # §9 (approval-gated)
-else:                                                     # error / timeout = TRANSIENT
-    retry_or_fail(task)          # NOT cached; on exhaustion status='unreadable', fan out
+        emit_sse(run, "task.updated"); maybe_finalize(run)   # §6 lifecycle step 5
 ```
 
 `reconcile_detections` closes the remediation loop (#6): a `corrupt` verdict opens
@@ -142,6 +156,8 @@ else:                                                     # error / timeout = TR
 a different hash** auto-resolves it. So once a file is replaced with a clean copy,
 its old detection clears itself. Replacement proposal is **per subscribing job**
 (a shared task may have subscribers whose jobs differ on `auto_replace`).
+`maybe_finalize` completes a run once its every `run_files` row has a terminal
+disposition/outcome — reached for all three outcomes, so no run is left hanging.
 
 **Why this satisfies every requirement:**
 
