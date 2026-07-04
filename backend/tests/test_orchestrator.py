@@ -14,6 +14,7 @@ import pytest
 from sqlmodel import Session, select
 
 from scanrr.core.config import RuntimeConfig
+from scanrr.core.events import EventBus
 from scanrr.db import engine as db_engine
 from scanrr.db.database import Database
 from scanrr.db.models import Detection, Job, JobRun, RunFile, ScanTask, ScanTaskSubscriber
@@ -196,6 +197,38 @@ async def test_crash_recovery_resumes_scanning_task(eng, media, tmp_path):
             assert s.exec(select(RunFile)).one().outcome == Verdict.OK
     finally:
         await orch.stop()
+
+
+async def test_orchestrator_publishes_events(eng, media, tmp_path):
+    bus = EventBus()
+    lib = lib_with(tmp_path, media, good="clean", bad="bitflip")
+    job_id = make_job(eng, lib)
+    orch = Orchestrator(Database(eng), InlineExecutor(), CFG, bus=bus, poll_interval=0.02)
+    await orch.start()
+
+    events: list[dict] = []
+
+    async def consume() -> None:
+        async for data in bus.subscribe():
+            event = json.loads(data)
+            events.append(event)
+            if event["type"] == "run.completed":
+                return
+
+    consumer = asyncio.create_task(consume())
+    await asyncio.sleep(0.05)  # let the consumer subscribe before we publish
+    try:
+        await orch.trigger_run(job_id)
+        await asyncio.wait_for(consumer, timeout=15)
+    finally:
+        consumer.cancel()
+        await orch.stop()
+
+    types = [e["type"] for e in events]
+    assert types.count("task.done") == 2
+    assert "run.progress" in types
+    completed = [e for e in events if e["type"] == "run.completed"][-1]
+    assert completed["files_corrupt"] == 1
 
 
 @pytest.mark.requires_ffmpeg

@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import time
+from dataclasses import dataclass
 
 from sqlmodel import Session, col, select
 
@@ -31,6 +32,7 @@ from scanrr.enums import (
     DetectorBackend,
     DetectorStatus,
     Disposition,
+    JobType,
     RunStatus,
     RunTrigger,
     TaskStatus,
@@ -328,7 +330,7 @@ def record_verdict(
     out: integrity.Outcome,
     cache_it: bool,
     backend: DetectorBackend,
-) -> None:
+) -> TaskEvent:
     """Persist an ok/corrupt verdict, reconcile detections, fan out, finalize."""
     task = session.get(ScanTask, task_id)
     assert task is not None
@@ -342,10 +344,10 @@ def record_verdict(
     first_run = next(iter(queue.subscribers(session, task_id)), None)
     reconcile_detections(session, file, content_hash, verdict, first_run)
     _fan_out(session, task, verdict)
-    _finalize_affected(session, task_id)
+    return _task_event(session, task_id, task.path, verdict)
 
 
-def record_unreadable(session: Session, task_id: int, error: str | None) -> None:
+def record_unreadable(session: Session, task_id: int, error: str | None) -> TaskEvent:
     """Mark a task unreadable (retries exhausted), fan out, finalize."""
     task = session.get(ScanTask, task_id)
     assert task is not None
@@ -354,7 +356,7 @@ def record_unreadable(session: Session, task_id: int, error: str | None) -> None
     task.error = error
     session.add(task)
     _fan_out(session, task, Verdict.UNREADABLE)
-    _finalize_affected(session, task_id)
+    return _task_event(session, task_id, task.path, Verdict.UNREADABLE)
 
 
 def _run_incomplete(session: Session, run_id: int) -> bool:
@@ -378,9 +380,52 @@ def finalize_run_if_done(session: Session, run_id: int) -> bool:
     return False
 
 
-def _finalize_affected(session: Session, task_id: int) -> None:
+@dataclass
+class RunProgress:
+    run_id: int
+    status: RunStatus
+    files_discovered: int
+    files_scanned: int
+    files_skipped: int
+    files_corrupt: int
+    files_unreadable: int
+
+
+@dataclass
+class TaskEvent:
+    task_id: int
+    path: str
+    verdict: Verdict
+    runs: list[RunProgress]
+
+
+def _progress(run: JobRun) -> RunProgress:
+    assert run.id is not None
+    return RunProgress(
+        run_id=run.id,
+        status=run.status,
+        files_discovered=run.files_discovered,
+        files_scanned=run.files_scanned,
+        files_skipped=run.files_skipped,
+        files_corrupt=run.files_corrupt,
+        files_unreadable=run.files_unreadable,
+    )
+
+
+def get_progress(session: Session, run_id: int) -> RunProgress | None:
+    run = session.get(JobRun, run_id)
+    return _progress(run) if run is not None else None
+
+
+def _task_event(session: Session, task_id: int, path: str, verdict: Verdict) -> TaskEvent:
+    """Finalize every subscribed run and collect their progress for eventing."""
+    runs: list[RunProgress] = []
     for run_id in queue.subscribers(session, task_id):
         finalize_run_if_done(session, run_id)
+        run = session.get(JobRun, run_id)
+        if run is not None:
+            runs.append(_progress(run))
+    return TaskEvent(task_id=task_id, path=path, verdict=verdict, runs=runs)
 
 
 def cancel_run(session: Session, run_id: int) -> list[int]:
@@ -463,3 +508,165 @@ def scheduled_jobs(session: Session) -> list[tuple[int, str]]:
         select(Job).where(col(Job.enabled).is_(True), col(Job.schedule_cron).is_not(None))
     )
     return [(j.id, j.schedule_cron) for j in rows if j.id is not None and j.schedule_cron]
+
+
+# --- read/triage helpers for the API (M3) ----------------------------------- #
+
+
+def _job_dict(session: Session, job: Job) -> dict:
+    last = session.exec(
+        select(JobRun).where(JobRun.job_id == job.id).order_by(col(JobRun.id).desc()).limit(1)
+    ).first()
+    return {
+        "id": job.id,
+        "name": job.name,
+        "type": job.type,
+        "enabled": job.enabled,
+        "ttl_seconds": job.ttl_seconds,
+        "schedule_cron": job.schedule_cron,
+        "root_path": json.loads(job.config).get("root_path"),
+        "auto_replace": job.auto_replace,
+        "last_run": None
+        if last is None
+        else {"id": last.id, "status": last.status, "finished_at": last.finished_at},
+    }
+
+
+def list_jobs(session: Session) -> list[dict]:
+    jobs = session.exec(select(Job).order_by(col(Job.id))).all()
+    return [_job_dict(session, j) for j in jobs]
+
+
+def create_job(
+    session: Session, *, name: str, root_path: str, ttl_seconds: int, schedule_cron: str | None
+) -> dict:
+    job = Job(
+        name=name,
+        type=JobType.PATH,
+        ttl_seconds=ttl_seconds,
+        schedule_cron=schedule_cron,
+        config=json.dumps({"root_path": root_path}),
+    )
+    session.add(job)
+    session.flush()
+    return _job_dict(session, job)
+
+
+def update_job(session: Session, job_id: int, fields: dict) -> dict | None:
+    job = session.get(Job, job_id)
+    if job is None:
+        return None
+    for key in ("name", "enabled", "ttl_seconds", "schedule_cron", "auto_replace"):
+        if key in fields and fields[key] is not None:
+            setattr(job, key, fields[key])
+    job.updated_at = clock.iso_now()
+    session.add(job)
+    session.flush()
+    return _job_dict(session, job)
+
+
+def delete_job(session: Session, job_id: int) -> bool:
+    job = session.get(Job, job_id)
+    if job is None:
+        return False
+    session.delete(job)
+    return True
+
+
+def _run_dict(run: JobRun) -> dict:
+    return {
+        "id": run.id,
+        "job_id": run.job_id,
+        "status": run.status,
+        "trigger": run.trigger,
+        "files_discovered": run.files_discovered,
+        "files_scanned": run.files_scanned,
+        "files_skipped": run.files_skipped,
+        "files_corrupt": run.files_corrupt,
+        "files_unreadable": run.files_unreadable,
+        "started_at": run.started_at,
+        "finished_at": run.finished_at,
+    }
+
+
+def get_run(session: Session, run_id: int) -> dict | None:
+    run = session.get(JobRun, run_id)
+    return _run_dict(run) if run is not None else None
+
+
+def list_runs(session: Session, limit: int = 50) -> list[dict]:
+    runs = session.exec(select(JobRun).order_by(col(JobRun.id).desc()).limit(limit)).all()
+    return [_run_dict(r) for r in runs]
+
+
+def run_files(session: Session, run_id: int) -> list[dict]:
+    rows = session.exec(
+        select(RunFile).where(RunFile.job_run_id == run_id).order_by(col(RunFile.path))
+    ).all()
+    return [
+        {"path": r.path, "disposition": r.disposition, "outcome": r.outcome} for r in rows
+    ]
+
+
+def list_detections(session: Session, status: DetectionStatus | None = None) -> list[dict]:
+    stmt = select(Detection, File).join(File, col(Detection.file_id) == col(File.id))
+    if status is not None:
+        stmt = stmt.where(Detection.status == status)
+    rows = session.exec(stmt.order_by(col(Detection.id).desc())).all()
+    out = []
+    for det, file in rows:
+        sr = session.get(ScanResult, det.hash)
+        out.append(
+            {
+                "id": det.id,
+                "path": file.path,
+                "hash": det.hash,
+                "status": det.status,
+                "detected_at": det.detected_at,
+                "resolved_at": det.resolved_at,
+                "error_log": sr.error_log if sr is not None else None,
+            }
+        )
+    return out
+
+
+def set_detection_status(session: Session, det_id: int, status: DetectionStatus) -> bool:
+    det = session.get(Detection, det_id)
+    if det is None:
+        return False
+    det.status = status
+    det.resolved_at = (
+        clock.iso_now()
+        if status in (DetectionStatus.RESOLVED, DetectionStatus.IGNORED)
+        else None
+    )
+    session.add(det)
+    return True
+
+
+def stats(session: Session) -> dict:
+    results = {r.hash: r.status for r in session.exec(select(ScanResult)).all()}
+    hashes = [h for h in session.exec(select(File.hash)).all() if h is not None]
+    ok = sum(1 for h in hashes if results.get(h) == Verdict.OK)
+    corrupt = sum(1 for h in hashes if results.get(h) == Verdict.CORRUPT)
+    open_detections = len(
+        session.exec(
+            select(Detection).where(Detection.status == DetectionStatus.OPEN)
+        ).all()
+    )
+    active_runs = len(
+        session.exec(
+            select(JobRun).where(
+                col(JobRun.status).in_((RunStatus.RUNNING, RunStatus.CANCELLING))
+            )
+        ).all()
+    )
+    jobs = len(session.exec(select(Job)).all())
+    return {
+        "jobs": jobs,
+        "active_runs": active_runs,
+        "open_detections": open_detections,
+        "files_ok": ok,
+        "files_corrupt": corrupt,
+        "files_tracked": len(hashes),
+    }

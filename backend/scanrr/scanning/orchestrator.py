@@ -11,10 +11,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from dataclasses import asdict
 
 from sqlmodel import Session
 
 from scanrr.core.config import RuntimeConfig
+from scanrr.core.events import EventBus
 from scanrr.db.database import Database
 from scanrr.enums import DetectorStatus, RunTrigger, Verdict
 from scanrr.scanning import engine
@@ -31,11 +33,13 @@ class Orchestrator:
         executor: ScanExecutor,
         config: RuntimeConfig,
         *,
+        bus: EventBus | None = None,
         poll_interval: float = 0.5,
     ) -> None:
         self.db = db
         self.executor = executor
         self.config = config
+        self._bus = bus
         self._poll_interval = poll_interval
         self._max_workers = config.max_scan_workers
         self._inflight: dict[int, asyncio.Task[None]] = {}
@@ -68,8 +72,42 @@ class Orchestrator:
             return engine.start_run(session, job_id, trigger, self.config)
 
         run_id = await self.db.run(_start)
+        await self._publish_run_started(run_id)
         self._wake.set()
         return run_id
+
+    def _publish_progress(self, progress: engine.RunProgress) -> None:
+        if self._bus is None:
+            return
+        terminal = progress.status in engine.TERMINAL_RUN_STATES
+        etype = "run.completed" if terminal else "run.progress"
+        self._bus.publish({"type": etype, **asdict(progress)})
+
+    async def _publish_run_started(self, run_id: int) -> None:
+        if self._bus is None:
+            return
+
+        def _get(session: Session) -> engine.RunProgress | None:
+            return engine.get_progress(session, run_id)
+
+        progress = await self.db.run(_get)
+        if progress is not None:
+            self._bus.publish({"type": "run.started", "run_id": run_id})
+            self._publish_progress(progress)
+
+    def _publish_task(self, event: engine.TaskEvent) -> None:
+        if self._bus is None:
+            return
+        self._bus.publish(
+            {
+                "type": "task.done",
+                "task_id": event.task_id,
+                "path": event.path,
+                "verdict": event.verdict,
+            }
+        )
+        for progress in event.runs:
+            self._publish_progress(progress)
 
     async def cancel_run(self, run_id: int) -> None:
         orphaned = await self.db.run(lambda s: engine.cancel_run(s, run_id))
@@ -173,14 +211,16 @@ class Orchestrator:
         if verdict is None or content_hash is None:
             error = out.log or None
 
-            def _unreadable(session: Session) -> None:
-                engine.record_unreadable(session, task_id, error)
+            def _unreadable(session: Session) -> engine.TaskEvent:
+                return engine.record_unreadable(session, task_id, error)
 
-            await self.db.run(_unreadable)
+            self._publish_task(await self.db.run(_unreadable))
         else:
             ch, verd, outcome, ci = content_hash, verdict, out, cache_it
 
-            def _record(session: Session) -> None:
-                engine.record_verdict(session, task_id, ch, verd, outcome, ci, cfg.detector_backend)
+            def _record(session: Session) -> engine.TaskEvent:
+                return engine.record_verdict(
+                    session, task_id, ch, verd, outcome, ci, cfg.detector_backend
+                )
 
-            await self.db.run(_record)
+            self._publish_task(await self.db.run(_record))

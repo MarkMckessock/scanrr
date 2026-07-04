@@ -38,10 +38,19 @@
       bounded-concurrency, timeout→unreadable, cancel-terminates-inflight,
       crash-recovery-resumes, real-pool + full-stack HTTP smokes.
 
-**Deviations / deferrals:** using pip + venv (not `uv`); **Alembic still deferred**
-(schema via `create_all` + raw DDL — baseline once it stabilises). `POST
-/library/revalidate` (#7) **not yet implemented** — moved to M3 alongside the
-settings UI. `misfire_grace_time`/schedule reload land with the jobs UI (M3).
+- [x] **M3 UI** — SSE event bus (`core/events.py`) the orchestrator publishes to
+      (run.started/progress/completed, task.done); read/action API (stats, jobs
+      CRUD, runs, run files, detection triage, settings, `/api/events`); React +
+      Vite + TS + Tailwind v4 SPA (Dashboard, Jobs, live Run detail, Detections
+      triage, Settings) wired via TanStack Query + live SSE invalidation; FastAPI
+      serves the built `dist`. Backend 29 tests (incl. event-wiring + endpoint +
+      SPA-serve); `npm run build` (tsc + vite) green; CI builds both.
+
+**Deviations / deferrals:** pip + venv (not `uv`); **Alembic still deferred**
+(schema via `create_all` + raw DDL). UI uses hand-written Tailwind components
+(not the shadcn CLI), CSS bars instead of Recharts, and no Playwright yet —
+kept deps lean and the build reliable. **Settings is read-only** and `POST
+/library/revalidate` (#7) still pending — both land when settings editing does.
 
 ---
 
