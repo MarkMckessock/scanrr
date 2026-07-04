@@ -71,6 +71,18 @@
       delete/search/imported. UI Replacements page. 52 backend tests (notification
       batching + drain; full executor loop incl. retry→exhaust + auto-propose-on-scan).
 
+- [x] **M6 deployment (kube-saturn)** — multi-stage `deploy/Dockerfile` (Vite build →
+      Python 3.12 + ffmpeg, uvicorn) + GHCR build workflow. Flux app under
+      `kubernetes/apps/media/scanrr` on the bjw-s app-template: volsync-backed PVC for
+      SQLite, read-only NFS media (granite + basalt), route to
+      `scanrr.markmckessock.com`, `/api/health` probes. Config rendered by an
+      **ExternalSecret** — jobs/settings literal in git, arr/pushover keys pulled
+      per-field from the existing 1Password items; mounted read-only at
+      `/config/scanrr.yaml`. Four **arr-type** jobs (radarr, radarr-4k, sonarr,
+      sonarr-4k), `auto_replace` off for initial testing. Cloudflare Zero Trust
+      (admin-only) via `terraform/cloudflare/zero_trust.tf`. Config validated against
+      scanrr's own loader; kustomize builds clean. Runbook: `deploy/README.md`.
+
 **Deviations / deferrals:** pip + venv (not `uv`); **Alembic still deferred**
 (schema via `create_all` + raw DDL). UI uses hand-written Tailwind components
 (not the shadcn CLI), CSS bars instead of Recharts, and no Playwright yet —

@@ -869,10 +869,12 @@ Notifications: `notification_flush_interval` (default 300s),
 
 ## 14. Security & Safety
 
-- **Secrets in the mounted config:** arr API keys live in the YAML config file (§0),
-  which contains secrets and so should be mounted from a **Kubernetes Secret** (not a
-  ConfigMap). Because k8s handles encryption-at-rest and RBAC, there is **no
-  app-level encryption**. The API never returns `api_key`.
+- **Secrets in the mounted config:** arr API keys and Pushover tokens live in the
+  YAML config file (§0). In the homelab it is **rendered by an ExternalSecret**: the
+  jobs/settings/mappings are literal in the template (versioned in git), while the
+  secret values are pulled per-field from 1Password, producing a Kubernetes **Secret**
+  mounted read-only at `/config/scanrr.yaml`. Because k8s handles encryption-at-rest
+  and RBAC, there is **no app-level encryption**. The API never returns `api_key`.
 - **Media mounts read-only** — scanrr never writes to the library. The only writes
   to arr-managed files are explicit `auto_replace` deletions via the arr API.
 - **Destructive ops gated:** `auto_replace` off by default; deletions require
