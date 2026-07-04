@@ -255,6 +255,16 @@ async def list_notifications(request: Request) -> list[dict]:
     return await _db(request).run(engine.list_notifications)
 
 
+@app.get("/api/activity")
+async def activity(request: Request) -> dict:
+    """Live dashboard feed: running jobs (progress + ETA) and files decoding now."""
+    db = _db(request)
+    return {
+        "runs": await db.run(engine.active_runs),
+        "tasks": await db.run(engine.active_tasks),
+    }
+
+
 # --- realtime --------------------------------------------------------------- #
 
 

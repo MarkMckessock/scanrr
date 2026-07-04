@@ -84,6 +84,22 @@ class ScanTaskSubscriber(SQLModel, table=True):
     job_run_id: int = Field(foreign_key="job_runs.id", primary_key=True)
 
 
+class ScanProgress(SQLModel, table=True):
+    """Live intra-file decode progress for a SCANNING task. Written by the main
+    process (fed by worker updates over an IPC queue — workers never touch the DB),
+    deleted when the task finishes. One row per in-flight task."""
+
+    __tablename__ = "scan_progress"
+    task_id: int = Field(
+        sa_column=Column(Integer, ForeignKey("scan_tasks.id", ondelete="CASCADE"), primary_key=True)
+    )
+    position_s: float = 0.0   # furthest decoded timestamp
+    duration_s: float = 0.0   # total, 0 if unknown
+    frames: int = 0
+    pct: float | None = None  # position_s / duration_s, None if duration unknown
+    updated_at: str = Field(default_factory=clock.iso_now)
+
+
 class RunFile(SQLModel, table=True):
     __tablename__ = "run_files"
     job_run_id: int = Field(foreign_key="job_runs.id", primary_key=True)

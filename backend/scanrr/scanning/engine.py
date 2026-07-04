@@ -12,6 +12,7 @@ import os
 import time
 from dataclasses import dataclass
 
+from sqlalchemy import ColumnElement, func
 from sqlmodel import Session, col, select
 
 from scanrr.core import clock
@@ -27,6 +28,7 @@ from scanrr.db.models import (
     NotificationQueue,
     Replacement,
     RunFile,
+    ScanProgress,
     ScanResult,
     ScanTask,
     ScanTaskSubscriber,
@@ -48,6 +50,7 @@ from scanrr.enums import (
 from scanrr.jobs import queue
 from scanrr.jobs.discovery import walk_media
 from scanrr.scanning import integrity, worker
+from scanrr.scanning.executor import ProgressUpdate
 from scanrr.scanning.hashing import hash_file
 
 _OPEN_DETECTION_STATES = (
@@ -1088,3 +1091,104 @@ def list_notifications(session: Session, limit: int = 50) -> list[dict]:
         }
         for r in rows
     ]
+
+
+# --- live activity (dashboard) ---------------------------------------------- #
+
+_SKIPPED = (Disposition.SKIPPED_TTL, Disposition.SKIPPED_TOO_FRESH)
+
+
+def _count(session: Session, *where: ColumnElement[bool]) -> int:
+    return int(session.exec(select(func.count()).select_from(RunFile).where(*where)).one())
+
+
+def active_runs(session: Session) -> list[dict]:
+    """Running runs with LIVE progress + ETA, computed from the run_files ledger
+    (the JobRun counters are only materialised at finalize)."""
+    runs = session.exec(select(JobRun).where(JobRun.status == RunStatus.RUNNING)).all()
+    out: list[dict] = []
+    for run in runs:
+        total = run.files_discovered
+        rid = col(RunFile.job_run_id) == run.id
+        scanned = _count(session, rid, col(RunFile.outcome).is_not(None))
+        skipped = _count(session, rid, col(RunFile.disposition).in_(_SKIPPED))
+        corrupt = _count(session, rid, col(RunFile.outcome) == Verdict.CORRUPT)
+        done = scanned + skipped
+        elapsed = clock.age_seconds(run.started_at) if run.started_at else 0.0
+        # ETA extrapolates from throughput so far; None until at least one file lands.
+        eta = (elapsed * (total - done) / done) if done > 0 and total > done else None
+        out.append(
+            {
+                "run_id": run.id,
+                "job_name": run.job_name,
+                "started_at": run.started_at,
+                "files_total": total,
+                "files_done": done,
+                "files_corrupt": corrupt,
+                "progress": round(done / total, 4) if total else 0.0,
+                "elapsed_seconds": round(elapsed),
+                "eta_seconds": round(eta) if eta is not None else None,
+            }
+        )
+    return out
+
+
+def active_tasks(session: Session, limit: int = 50) -> list[dict]:
+    """Files being decoded right now (claimed → SCANNING). updated_at is the claim
+    time, so it doubles as 'started scanning at' for elapsed display; the live
+    intra-file decode progress comes from scan_progress."""
+    rows = session.exec(
+        select(ScanTask)
+        .where(ScanTask.status == TaskStatus.SCANNING)
+        .order_by(col(ScanTask.updated_at))
+        .limit(limit)
+    ).all()
+    out: list[dict] = []
+    for t in rows:
+        try:
+            size: int | None = os.stat(t.path).st_size
+        except OSError:
+            size = None
+        prog = session.get(ScanProgress, t.id) if t.id is not None else None
+        out.append(
+            {
+                "task_id": t.id,
+                "path": t.path,
+                "started_at": t.updated_at,
+                "size_bytes": size,
+                "pct": prog.pct if prog is not None else None,
+                "position_s": prog.position_s if prog is not None else None,
+                "duration_s": prog.duration_s if prog is not None else None,
+                "frames": prog.frames if prog is not None else None,
+            }
+        )
+    return out
+
+
+def upsert_progress(session: Session, updates: list[ProgressUpdate]) -> None:
+    """Persist the latest decode position for each in-flight task (main thread)."""
+    for u in updates:
+        task = session.get(ScanTask, u.task_id)
+        if task is None or task.status is not TaskStatus.SCANNING:
+            continue  # finished/vanished — don't resurrect a stale progress row
+        row = session.get(ScanProgress, u.task_id)
+        if row is None:
+            row = ScanProgress(task_id=u.task_id)
+        row.position_s = u.position_s
+        row.duration_s = u.duration_s
+        row.frames = u.frames
+        row.pct = round(u.position_s / u.duration_s, 4) if u.duration_s > 0 else None
+        row.updated_at = clock.iso_now()
+        session.add(row)
+
+
+def clear_progress(session: Session, task_id: int) -> None:
+    row = session.get(ScanProgress, task_id)
+    if row is not None:
+        session.delete(row)
+
+
+def clear_all_progress(session: Session) -> None:
+    """Drop stale progress rows (e.g. at startup after a crash)."""
+    for row in session.exec(select(ScanProgress)).all():
+        session.delete(row)

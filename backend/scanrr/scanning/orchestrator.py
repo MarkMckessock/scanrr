@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from dataclasses import asdict
 
 from sqlmodel import Session
@@ -19,11 +20,12 @@ from sqlmodel import Session
 from scanrr.core.config import RuntimeConfig
 from scanrr.core.events import EventBus
 from scanrr.core.fileconfig import ArrInstanceSpec, JobSpec
+from scanrr.core.logging import decision
 from scanrr.db.database import Database
 from scanrr.enums import DetectorStatus, JobType, RunTrigger, Verdict
 from scanrr.integrations.arr import apply_path_mapping, make_client
 from scanrr.scanning import engine
-from scanrr.scanning.executor import ScanExecutor
+from scanrr.scanning.executor import ProgressUpdate, ScanExecutor
 from scanrr.scanning.integrity import Outcome
 
 _log = logging.getLogger("scanrr")
@@ -53,6 +55,7 @@ class Orchestrator:
         self._wake = asyncio.Event()
         self._running = False
         self._drain_task: asyncio.Task[None] | None = None
+        self._progress_task: asyncio.Task[None] | None = None
 
     # --- lifecycle ---------------------------------------------------------- #
 
@@ -60,17 +63,42 @@ class Orchestrator:
         recovered = await self.db.run(engine.recover_interrupted)
         if recovered:
             _log.info("recovered %d interrupted task(s)", recovered)
+        await self.db.run(engine.clear_all_progress)
         self._running = True
         self._drain_task = asyncio.create_task(self._drain_loop())
+        self._progress_task = asyncio.create_task(self._progress_loop())
 
     async def stop(self) -> None:
         self._running = False
         self._wake.set()
         if self._drain_task is not None:
             await self._drain_task
+        if self._progress_task is not None:
+            self._progress_task.cancel()
+            await asyncio.gather(self._progress_task, return_exceptions=True)
         if self._inflight:
             await asyncio.gather(*list(self._inflight.values()), return_exceptions=True)
         await self.executor.close()
+
+    async def _progress_loop(self) -> None:
+        """Drain worker decode-progress updates and persist them (SPEC §6)."""
+        while self._running:
+            try:
+                await asyncio.sleep(1.0)
+            except asyncio.CancelledError:
+                break
+            updates = self.executor.poll_progress()
+            if updates:
+                try:
+                    await self._persist_progress(updates)
+                except Exception:
+                    _log.exception("progress persist failed")
+
+    async def _persist_progress(self, updates: list[ProgressUpdate]) -> None:
+        def _op(session: Session) -> None:
+            engine.upsert_progress(session, updates)
+
+        await self.db.run(_op)
 
     # --- run control -------------------------------------------------------- #
 
@@ -85,6 +113,7 @@ class Orchestrator:
             return engine.start_run(session, spec, trigger, self.config, candidates)
 
         run_id = await self.db.run(_start)
+        _log.info("run %d started for job %r (trigger=%s)", run_id, spec.slug, trigger.value)
         await self._publish_run_started(run_id)
         self._wake.set()
         return run_id
@@ -127,6 +156,12 @@ class Orchestrator:
         if self._bus is None:
             return
         terminal = progress.status in engine.TERMINAL_RUN_STATES
+        if terminal:
+            _log.info(
+                "run %d %s: %d scanned, %d corrupt, %d unreadable, %d skipped",
+                progress.run_id, progress.status.value, progress.files_scanned,
+                progress.files_corrupt, progress.files_unreadable, progress.files_skipped,
+            )
         etype = "run.completed" if terminal else "run.progress"
         self._bus.publish({"type": etype, **asdict(progress)})
 
@@ -224,6 +259,8 @@ class Orchestrator:
 
     async def _process(self, task_id: int, path: str) -> None:
         cfg = self.config
+        started = time.monotonic()
+        decision("scan_started", task_id=task_id, path=path)
         content_hash: str | None = None
         verdict: Verdict | None = None
         cache_it = False
@@ -240,7 +277,9 @@ class Orchestrator:
                 if cached is not None:
                     verdict, cache_it = cached, False
                     break
-                out = await self.executor.decode(path, cfg.detector_backend, cfg.max_scan_seconds)
+                out = await self.executor.decode(
+                    path, cfg.detector_backend, cfg.max_scan_seconds, task_id=task_id
+                )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # transient (IO/worker) — retry
@@ -255,8 +294,10 @@ class Orchestrator:
                 break
             # DetectorStatus.ERROR / timeout → retry
 
+        ms = round((time.monotonic() - started) * 1000)
         if verdict is None or content_hash is None:
             error = out.log or None
+            decision("unreadable", task_id=task_id, path=path, ms=ms, error=error)
 
             def _unreadable(session: Session) -> engine.TaskEvent:
                 return engine.record_unreadable(session, task_id, error)
@@ -264,6 +305,10 @@ class Orchestrator:
             self._publish_task(await self.db.run(_unreadable))
         else:
             ch, verd, outcome, ci = content_hash, verdict, out, cache_it
+            decision(
+                "scanned", task_id=task_id, path=path, verdict=verd.value, ms=ms,
+                frames=out.frames_decoded, cached=not ci,
+            )
 
             def _record(session: Session) -> engine.TaskEvent:
                 return engine.record_verdict(
@@ -271,3 +316,8 @@ class Orchestrator:
                 )
 
             self._publish_task(await self.db.run(_record))
+
+        def _clear(session: Session) -> None:
+            engine.clear_progress(session, task_id)
+
+        await self.db.run(_clear)

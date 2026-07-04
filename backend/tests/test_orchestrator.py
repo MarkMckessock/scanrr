@@ -69,11 +69,14 @@ class GatedExecutor:
     async def hash(self, path, algorithm):
         return real_hash(path, algorithm)
 
-    async def decode(self, path, backend, timeout):
+    async def decode(self, path, backend, timeout, task_id=None):
         self.started += 1
         self._start_signal.release()
         await self.gate.wait()
         return Outcome(status=self._verdict, backend=backend)
+
+    def poll_progress(self):
+        return []
 
     async def await_started(self, n: int) -> None:
         for _ in range(n):
@@ -89,10 +92,13 @@ class AlwaysTransientExecutor:
     async def hash(self, path, algorithm):
         return real_hash(path, algorithm)
 
-    async def decode(self, path, backend, timeout):
+    async def decode(self, path, backend, timeout, task_id=None):
         return Outcome(
             status=DetectorStatus.ERROR, log=f"timeout after {timeout}s", backend=backend
         )
+
+    def poll_progress(self):
+        return []
 
     async def close(self):
         return None

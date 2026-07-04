@@ -23,6 +23,8 @@ from __future__ import annotations
 
 import logging
 import subprocess
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from scanrr.enums import DetectorBackend
@@ -85,13 +87,20 @@ class _ErrorCollector(logging.Handler):
 # --------------------------------------------------------------------------- #
 # PyAV backend
 # --------------------------------------------------------------------------- #
-def check_pyav(path: str) -> Outcome:
+def check_pyav(
+    path: str, *, on_progress: Callable[[float, float, int], None] | None = None
+) -> Outcome:
     """Integrity check using in-process libav decoding, with libav's ERROR log
     stream captured via Python logging.
 
     Assumes one file is decoded per process at a time (our worker-pool model --
     SPEC.md sec.6): the libav logger is process-global, so concurrent decodes in
     a single process would cross-contaminate captured errors.
+
+    ``on_progress(current_s, total_s, frames)`` is invoked (throttled to ~2s) as
+    decoding advances through the file, so callers can surface live per-file
+    progress -- current_s is the furthest packet PTS reached, total_s the
+    container duration (0 if unknown).
     """
     import av
     import av.error
@@ -119,17 +128,28 @@ def check_pyav(path: str) -> Outcome:
             return Outcome(
                 Status.ERROR, log=f"open failed: {exc}", backend=DetectorBackend.PYAV
             )
+        # container.duration is in av.time_base (AV_TIME_BASE = 1e6 microseconds).
+        total_s = (container.duration or 0) / 1_000_000
+        max_s = 0.0
+        last_report = time.monotonic()
         try:
             for packet in container.demux():
+                if packet.pts is not None and packet.time_base is not None:
+                    max_s = max(max_s, float(packet.pts * packet.time_base))
                 try:
                     for _frame in packet.decode():
                         frames += 1
                 except av.error.FFmpegError as exc:
                     exc_errors.append(str(exc))
+                if on_progress is not None and (time.monotonic() - last_report) >= 2.0:
+                    on_progress(max_s, total_s, frames)
+                    last_report = time.monotonic()
         except av.error.FFmpegError as exc:
             exc_errors.append(f"demux: {exc}")
         finally:
             container.close()
+            if on_progress is not None:
+                on_progress(max_s, total_s, frames)
     finally:
         logger.removeHandler(collector)
         logger.setLevel(prev_level)
@@ -193,10 +213,18 @@ BACKENDS = {
 }
 
 
-def check(path: str, backend: DetectorBackend = DetectorBackend.PYAV) -> Outcome:
-    """Run the configured backend against ``path``."""
+def check(
+    path: str,
+    backend: DetectorBackend = DetectorBackend.PYAV,
+    *,
+    on_progress: Callable[[float, float, int], None] | None = None,
+) -> Outcome:
+    """Run the configured backend against ``path``. ``on_progress`` is only wired
+    for the PyAV backend (the subprocess backend has no in-loop hook)."""
     try:
-        fn = BACKENDS[DetectorBackend(backend)]
-    except (KeyError, ValueError):
+        resolved = DetectorBackend(backend)
+    except ValueError:
         raise ValueError(f"unknown detector backend: {backend!r}") from None
-    return fn(path)
+    if resolved is DetectorBackend.PYAV:
+        return check_pyav(path, on_progress=on_progress)
+    return check_subprocess(path)

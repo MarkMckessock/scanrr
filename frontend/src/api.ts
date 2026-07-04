@@ -90,6 +90,34 @@ export interface NotificationEntry {
   created_at: string;
 }
 
+export interface ActiveRun {
+  run_id: number;
+  job_name: string;
+  started_at: string | null;
+  files_total: number;
+  files_done: number;
+  files_corrupt: number;
+  progress: number;
+  elapsed_seconds: number;
+  eta_seconds: number | null;
+}
+
+export interface ActiveTask {
+  task_id: number;
+  path: string;
+  started_at: string | null;
+  size_bytes: number | null;
+  pct: number | null;
+  position_s: number | null;
+  duration_s: number | null;
+  frames: number | null;
+}
+
+export interface Activity {
+  runs: ActiveRun[];
+  tasks: ActiveTask[];
+}
+
 const BASE = "/api";
 
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
@@ -125,4 +153,5 @@ export const api = {
   rejectReplacement: (id: number) => post<Replacement>(`/replacements/${id}/reject`),
   approveAllReplacements: () => post<{ approved: number }>("/replacements/approve"),
   notifications: () => req<NotificationEntry[]>("/notifications"),
+  activity: () => req<Activity>("/activity"),
 };
