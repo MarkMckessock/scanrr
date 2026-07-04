@@ -224,43 +224,42 @@ survives restarts.
 
 ## 7. FFmpeg Integrity Checking
 
-**Primary — PyAV (in-process libav bindings):** open the container with aggressive
-error detection, demux every packet, and decode every frame of every stream,
-collecting `av.AVError`s.
+Two interchangeable backends, validated to agree against a shared corrupted-media
+fixture set (`backend/tests/test_integrity.py`). Implemented in
+`backend/scanrr/scanning/integrity.py`.
 
-```python
-import av
+**Primary — PyAV (in-process libav bindings):** open with aggressive error
+detection, demux and decode every frame of every stream, and capture libav's
+**ERROR-level log stream** — not just exceptions. This last point is the whole
+game and was proven necessary by the M1 spike:
 
-def ffmpeg_integrity_check(path: str) -> ScanOutcome:
-    errors: list[str] = []
-    try:
-        container = av.open(path, options={"err_detect": "aggressive"})
-    except av.AVError as e:
-        return ScanOutcome("error", log=f"open failed: {e}")   # unreadable/not media
-    try:
-        for packet in container.demux():          # video + audio streams
-            try:
-                for _frame in packet.decode():
-                    pass                            # decoding is the integrity test
-            except av.AVError as e:
-                errors.append(str(e))
-    except av.AVError as e:
-        errors.append(str(e))
-    finally:
-        container.close()
-    return ScanOutcome("corrupt", log="\n".join(errors)) if errors \
-        else ScanOutcome("ok")
-```
+- libav *conceals* most decode errors (bad macroblocks, damaged GOPs, premature
+  EOF) and returns the frame **successfully** — reporting the problem only via
+  `av_log`. A loop that only catches `av.FFmpegError` reports these files `ok`
+  (verified false negative on a truncated file). So we must read the log stream.
+- Capture it through **Python's stdlib `logging`** (PyAV forwards libav logs to
+  the `libav` logger), *not* `av.logging.Capture()`: `Capture()` is thread-local
+  and misses errors emitted from libav's **decoder worker threads**. A stdlib
+  logging handler on the `libav` logger is thread-safe and catches them.
+- Disable `AV_LOG_SKIP_REPEATED` (`av.logging.set_skip_repeated(False)`): libav
+  suppresses identical consecutive messages, so in a **reused worker process** a
+  second file emitting the same error string would be misclassified `ok`.
+- Constraint: the libav logger is process-global → one file decoded per process
+  at a time (matches the worker-pool model, §6).
 
-- Full decode of all frames is what actually catches bad i-frames / bitstream rot.
-- `err_detect=aggressive` mirrors the reference CLI behaviour.
-- **Statuses:** `ok` (clean), `corrupt` (decoded but with frame errors),
-  `error` (couldn't open/demux — likely truncated or not a video).
+**Statuses:** `ok` (decoded clean), `corrupt` (opened + decoded but ERROR logs),
+`error` (couldn't open/demux — mangled header, not media).
 
-**Fallback — subprocess** (config `detector_backend: pyav | subprocess`), for
-codecs/builds where PyAV misbehaves:
-`ffmpeg -v error -err_detect aggressive -i <file> -f null -` → nonzero exit or
-stderr = corrupt. Same `ScanOutcome` shape either way.
+**Reference — subprocess** (config `detector_backend: pyav | subprocess`):
+`ffmpeg -v error -err_detect aggressive -i <file> -map 0 -f null -`. Classify by
+**exit code** (robust where stderr string-matching is not): `rc != 0` → `error`;
+`rc == 0` + stderr → `corrupt`; `rc == 0` + empty → `ok`. `-map 0` decodes every
+stream for parity with PyAV's `demux()`.
+
+**Spike result:** both backends agree on the pass/fail verdict for clean,
+bit-flipped, truncated, and header-corrupted samples. **[OPEN]** which is primary
+in prod — decide on throughput once we benchmark on real 4K remuxes over NFS; the
+subprocess contract is simpler, PyAV avoids a fork per file.
 
 **Discovery filter:** configurable media extensions
 (`.mkv .mp4 .avi .m4v .ts .mov .wmv .flv .webm .mpg .mpeg .m2ts` …) and a minimum

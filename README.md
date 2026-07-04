@@ -24,3 +24,19 @@ decisions.
 ## Stack
 
 FastAPI · SQLite · PyAV · blake3 · React + Tailwind + shadcn/ui. See the spec for detail.
+
+## Development
+
+Requires Python 3.12+ and the `ffmpeg` CLI on PATH (used to synthesise test fixtures
+and as the reference detector backend).
+
+```sh
+cd backend
+python3.12 -m venv .venv
+.venv/bin/pip install -e '.[dev]'
+.venv/bin/python -m pytest        # detection-efficacy regression tests
+```
+
+The tests generate clean + deliberately-corrupted media samples and assert both
+detector backends (`pyav`, `subprocess`) agree on the verdict — the regression
+guard for scanrr's core function. See `backend/scanrr/scanning/integrity.py`.
