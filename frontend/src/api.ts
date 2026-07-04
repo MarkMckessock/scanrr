@@ -21,7 +21,7 @@ export interface Job {
   ttl_seconds: number;
   schedule_cron: string | null;
   root_path: string | null;
-  arr_instance_id: number | null;
+  arr_instance: string | null;
   auto_replace: boolean;
   last_run: RunSummary | null;
 }

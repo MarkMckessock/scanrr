@@ -481,9 +481,11 @@ owns the canonical migrations.
 
 **Conventions.** All timestamps are `TEXT` in **ISO-8601 UTC** (`YYYY-MM-DDTHH:MM:SSZ`).
 **Retention:** `scan_results` is the durable content cache — intentionally permanent
-(one row per distinct content ever seen). `scan_tasks` rows are pruned once `done`
-and all subscribing runs have finalized (the per-run record lives on in `run_files`);
-`notification_queue` rows are deleted after a successful flush.
+(one row per distinct content ever seen). `done` `scan_tasks` are *eligible* for
+pruning once all subscribing runs have finalized (the per-run record lives on in
+`run_files`) — a background prune is **planned but not yet implemented**, so done
+tasks are currently retained (harmless: dedup only targets *active* tasks).
+`notification_queue` rows are deleted after a successful flush (M5).
 
 ```sql
 -- NB: there is NO `jobs` table and NO `arr_instances`/`path_mappings` tables —
@@ -520,7 +522,7 @@ CREATE TABLE job_runs (
     files_unreadable   INTEGER NOT NULL DEFAULT 0,   -- transient failures exhausted
     error_message      TEXT
 );
-CREATE INDEX ix_job_runs_job ON job_runs(job_slug, id);
+CREATE INDEX ix_job_runs_job ON job_runs(job_slug);  -- run history by job
 
 -- Global, path-deduplicated scan queue shared by ALL runs (Q2). One row per file
 -- currently needing work; unique by path while active so overlapping jobs never

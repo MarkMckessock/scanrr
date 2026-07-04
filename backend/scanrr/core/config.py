@@ -1,8 +1,8 @@
-"""Configuration. Two layers (SPEC §13):
+"""Configuration (SPEC §0, §13). Effective config = ``DEFAULTS`` overlaid with the
+YAML ``settings:`` stanza (loaded in ``core.fileconfig``).
 
-* env vars (deploy-time) via ``Settings`` — DB path, media roots, secrets, log level.
-* the ``settings`` DB table (runtime-editable) — the tunables below. This module is
-  the **canonical source of defaults**; other code reads them from ``DEFAULTS``.
+* env vars (deploy-time) via ``Settings`` — DB URL, config-file path, API token, log level.
+* ``RuntimeConfig``/``DEFAULTS`` — the **canonical source of tunable defaults**.
 """
 
 from __future__ import annotations

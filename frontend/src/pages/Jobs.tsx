@@ -98,7 +98,7 @@ export default function Jobs() {
                     {j.name}
                   </span>
                   <span className="font-mono text-xs text-slate-500">
-                    {j.root_path ?? (j.arr_instance_id != null ? `arr #${j.arr_instance_id}` : "")}
+                    {j.root_path ?? (j.arr_instance ? `arr: ${j.arr_instance}` : "")}
                   </span>
                 </td>
                 <td className="px-4 py-2">
