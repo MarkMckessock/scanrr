@@ -23,6 +23,14 @@ def _main() -> None:
 
 
 @app.command()
+def serve(host: str = "0.0.0.0", port: int = 8000) -> None:
+    """Run the API + orchestrator + scheduler service."""
+    import uvicorn
+
+    uvicorn.run("scanrr.api.app:app", host=host, port=port)
+
+
+@app.command()
 def scan(
     path: str,
     ttl_days: int = typer.Option(30, help="Skip files scanned within this window"),

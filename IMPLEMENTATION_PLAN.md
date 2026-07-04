@@ -29,11 +29,19 @@
       `reconcile_detections`, CLI (`scanrr scan`), minimal API. 20 tests green
       (14 detection + 6 idempotency); verified end-to-end via the CLI.
 - [x] All constrained values are enums (`scanrr/enums.py`); no `Any`/type-ignores.
+- [x] **M2 concurrency & durability** — async `Orchestrator` draining the shared
+      queue via a `pebble.ProcessPool` (bounded, per-file timeout, worker
+      termination); single-thread `Database` (atomic claims); crash recovery
+      (`scanning`→`pending` on startup); run cancellation; APScheduler cron wiring;
+      async `POST /jobs/:id/run` + `/runs/:id/cancel`. Executor is pluggable
+      (`InlineExecutor` for tests, `PebbleExecutor` in prod). 27 tests green incl.
+      bounded-concurrency, timeout→unreadable, cancel-terminates-inflight,
+      crash-recovery-resumes, real-pool + full-stack HTTP smokes.
 
-**Deviations from the M0/M1 plan below:** using pip + venv (not `uv`) for now;
-**Alembic deferred to M2** — M1 creates the schema via `SQLModel.metadata.create_all`
-+ raw DDL (`db/engine.py`) since the schema is still moving. Baseline migration
-lands once it stabilises.
+**Deviations / deferrals:** using pip + venv (not `uv`); **Alembic still deferred**
+(schema via `create_all` + raw DDL — baseline once it stabilises). `POST
+/library/revalidate` (#7) **not yet implemented** — moved to M3 alongside the
+settings UI. `misfire_grace_time`/schedule reload land with the jobs UI (M3).
 
 ---
 

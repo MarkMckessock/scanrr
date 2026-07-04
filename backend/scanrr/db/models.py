@@ -7,6 +7,7 @@ stored value is the enum value, never a bare string (see CLAUDE.md).
 
 from __future__ import annotations
 
+from sqlalchemy import Column, ForeignKey, Integer
 from sqlmodel import Field, SQLModel
 
 from scanrr.core import clock
@@ -91,7 +92,11 @@ class RunFile(SQLModel, table=True):
     path: str = Field(primary_key=True)
     disposition: Disposition = Field(sa_column=enum_col(Disposition))
     outcome: Verdict | None = Field(default=None, sa_column=enum_col(Verdict, nullable=True))
-    scan_task_id: int | None = Field(default=None, foreign_key="scan_tasks.id")
+    # SET NULL so an orphaned task can be dropped on cancel without orphaning this row.
+    scan_task_id: int | None = Field(
+        default=None,
+        sa_column=Column(Integer, ForeignKey("scan_tasks.id", ondelete="SET NULL"), nullable=True),
+    )
 
 
 class File(SQLModel, table=True):

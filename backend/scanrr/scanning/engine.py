@@ -16,7 +16,16 @@ from sqlmodel import Session, col, select
 from scanrr.core import clock
 from scanrr.core.config import RuntimeConfig
 from scanrr.core.logging import decision
-from scanrr.db.models import Detection, File, Job, JobRun, RunFile, ScanResult, ScanTask
+from scanrr.db.models import (
+    Detection,
+    File,
+    Job,
+    JobRun,
+    RunFile,
+    ScanResult,
+    ScanTask,
+    ScanTaskSubscriber,
+)
 from scanrr.enums import (
     DetectionStatus,
     DetectorBackend,
@@ -267,3 +276,190 @@ def run_job(
     session.commit()
     session.refresh(run)
     return run
+
+
+# --- M2 orchestrator operations (sync; each runs on the single DB thread) ---- #
+
+
+def recover_interrupted(session: Session) -> int:
+    """On startup, requeue tasks stuck 'scanning' (SPEC §6). Returns the count."""
+    stuck = list(session.exec(select(ScanTask).where(ScanTask.status == TaskStatus.SCANNING)))
+    for task in stuck:
+        task.status = TaskStatus.PENDING
+        task.updated_at = clock.iso_now()
+        session.add(task)
+    return len(stuck)
+
+
+def start_run(session: Session, job_id: int, trigger: RunTrigger, config: RuntimeConfig) -> int:
+    """Create a run and run Phase A discovery (enqueue). Returns the run id."""
+    job = session.get(Job, job_id)
+    assert job is not None and job.id is not None
+    run = JobRun(
+        job_id=job.id, status=RunStatus.RUNNING, trigger=trigger, started_at=clock.iso_now()
+    )
+    session.add(run)
+    session.flush()
+    assert run.id is not None
+    discover(session, job, run, config)
+    finalize_run_if_done(session, run.id)  # all-skipped runs finalize immediately
+    return run.id
+
+
+def claim(session: Session) -> tuple[int, str] | None:
+    """Atomically claim the next pending task; returns (id, path) as plain data."""
+    task = queue.claim_next_pending(session)
+    if task is None:
+        return None
+    assert task.id is not None
+    return task.id, task.path
+
+
+def check_cache(session: Session, content_hash: str, backend: DetectorBackend) -> Verdict | None:
+    sr = _valid_cached(session, content_hash, backend)
+    return Verdict(sr.status) if sr is not None else None
+
+
+def record_verdict(
+    session: Session,
+    task_id: int,
+    content_hash: str,
+    verdict: Verdict,
+    out: integrity.Outcome,
+    cache_it: bool,
+    backend: DetectorBackend,
+) -> None:
+    """Persist an ok/corrupt verdict, reconcile detections, fan out, finalize."""
+    task = session.get(ScanTask, task_id)
+    assert task is not None
+    task.content_hash = content_hash
+    if cache_it:
+        _cache_result(session, content_hash, verdict, out, backend)
+    file = _upsert_file(session, task.path, os.stat(task.path), content_hash)
+    task.status = TaskStatus.DONE
+    task.result_status = verdict
+    session.add(task)
+    first_run = next(iter(queue.subscribers(session, task_id)), None)
+    reconcile_detections(session, file, content_hash, verdict, first_run)
+    _fan_out(session, task, verdict)
+    _finalize_affected(session, task_id)
+
+
+def record_unreadable(session: Session, task_id: int, error: str | None) -> None:
+    """Mark a task unreadable (retries exhausted), fan out, finalize."""
+    task = session.get(ScanTask, task_id)
+    assert task is not None
+    task.status = TaskStatus.UNREADABLE
+    task.result_status = Verdict.UNREADABLE
+    task.error = error
+    session.add(task)
+    _fan_out(session, task, Verdict.UNREADABLE)
+    _finalize_affected(session, task_id)
+
+
+def _run_incomplete(session: Session, run_id: int) -> bool:
+    row = session.exec(
+        select(RunFile)
+        .where(
+            RunFile.job_run_id == run_id,
+            RunFile.disposition == Disposition.QUEUED,
+            col(RunFile.outcome).is_(None),
+        )
+        .limit(1)
+    ).first()
+    return row is not None
+
+
+def finalize_run_if_done(session: Session, run_id: int) -> bool:
+    run = session.get(JobRun, run_id)
+    if run is not None and run.status == RunStatus.RUNNING and not _run_incomplete(session, run_id):
+        _finalize_run(session, run)
+        return True
+    return False
+
+
+def _finalize_affected(session: Session, task_id: int) -> None:
+    for run_id in queue.subscribers(session, task_id):
+        finalize_run_if_done(session, run_id)
+
+
+def cancel_run(session: Session, run_id: int) -> list[int]:
+    """Unsubscribe a run; drop now-orphaned pending tasks. Returns orphaned
+    *scanning* task ids for the orchestrator to terminate (SPEC §6)."""
+    run = session.get(JobRun, run_id)
+    if run is None or run.status not in (RunStatus.RUNNING, RunStatus.CANCELLING):
+        return []
+    run.status = RunStatus.CANCELLING
+    session.add(run)
+    subs = list(
+        session.exec(
+            select(ScanTaskSubscriber).where(ScanTaskSubscriber.job_run_id == run_id)
+        )
+    )
+    task_ids = [s.scan_task_id for s in subs]
+    for sub in subs:
+        session.delete(sub)
+    session.flush()
+
+    orphaned_scanning: list[int] = []
+    for tid in task_ids:
+        if queue.subscribers(session, tid):
+            continue  # another run still needs it
+        task = session.get(ScanTask, tid)
+        if task is None:
+            continue
+        if task.status == TaskStatus.PENDING:
+            session.delete(task)  # never started — drop it
+        elif task.status == TaskStatus.SCANNING:
+            orphaned_scanning.append(tid)
+    return orphaned_scanning
+
+
+def mark_cancelled(session: Session, run_id: int) -> None:
+    run = session.get(JobRun, run_id)
+    if run is not None and run.status in (RunStatus.RUNNING, RunStatus.CANCELLING):
+        run.status = RunStatus.CANCELLED
+        run.finished_at = clock.iso_now()
+        session.add(run)
+
+
+def drop_orphan_task(session: Session, task_id: int) -> None:
+    """Delete a task that has no remaining subscribers (post-cancellation)."""
+    if queue.subscribers(session, task_id):
+        return
+    task = session.get(ScanTask, task_id)
+    if task is not None:
+        session.delete(task)
+
+
+TERMINAL_RUN_STATES = (
+    RunStatus.COMPLETED,
+    RunStatus.FAILED,
+    RunStatus.CANCELLED,
+    RunStatus.INTERRUPTED,
+)
+
+
+def get_run_status(session: Session, run_id: int) -> RunStatus | None:
+    run = session.get(JobRun, run_id)
+    return run.status if run is not None else None
+
+
+def job_has_active_run(session: Session, job_id: int) -> bool:
+    row = session.exec(
+        select(JobRun)
+        .where(
+            JobRun.job_id == job_id,
+            col(JobRun.status).in_((RunStatus.RUNNING, RunStatus.CANCELLING)),
+        )
+        .limit(1)
+    ).first()
+    return row is not None
+
+
+def scheduled_jobs(session: Session) -> list[tuple[int, str]]:
+    """(job_id, cron) for enabled jobs that have a schedule."""
+    rows = session.exec(
+        select(Job).where(col(Job.enabled).is_(True), col(Job.schedule_cron).is_not(None))
+    )
+    return [(j.id, j.schedule_cron) for j in rows if j.id is not None and j.schedule_cron]

@@ -274,14 +274,15 @@ full-file reads — both blake3 hashing and ffmpeg decoding — run inside the w
 processes, so they're bounded by `max_scan_workers` (§3). The worker returns
 `(content_hash, status, error_log, duration_ms)`; it takes only the path.
 
-**Single-writer design (#4).** SQLModel is synchronous, so DB calls must never run
-on the asyncio event loop. All **writes** are funnelled through one dedicated
-writer thread fed by an `asyncio.Queue`, preserving a single writer and keeping
-the loop unblocked; **reads** run in a threadpool (WAL permits concurrent readers).
-Discovery inserts are **batched** (`executemany`, commit every N rows) with
-periodic WAL checkpoints so a 100k-file enumeration can't stall the API/SSE.
-Worker processes never touch SQLite — they are pure functions returning results,
-which also sidesteps multi-process write contention.
+**Single DB thread (#4).** SQLModel is synchronous, so DB calls must never run on
+the asyncio event loop. **All** DB access is serialized onto one dedicated thread
+(a `max_workers=1` executor); each op opens a short session, commits, and returns
+plain data (never a live ORM object across the boundary). This one thread *is* the
+single writer, keeps the event loop unblocked, and — because it serializes — makes
+`claim_next_pending` (SELECT-then-UPDATE-to-`scanning`) atomic for free, so two
+concurrent pipelines can't claim the same task. Read latency serializes behind
+writes too, which is fine at homelab scale. Worker processes never touch SQLite —
+they are pure functions returning results, sidestepping multi-process contention.
 
 ---
 
