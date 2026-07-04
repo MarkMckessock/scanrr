@@ -43,8 +43,11 @@
       CRUD, runs, run files, detection triage, settings, `/api/events`); React +
       Vite + TS + Tailwind v4 SPA (Dashboard, Jobs, live Run detail, Detections
       triage, Settings) wired via TanStack Query + live SSE invalidation; FastAPI
-      serves the built `dist`. Backend 29 tests (incl. event-wiring + endpoint +
-      SPA-serve); `npm run build` (tsc + vite) green; CI builds both.
+      serves the built `dist` (with an SPA fallback route so client routes deep-link).
+      Backend 29 tests (incl. event-wiring + endpoint + SPA-serve); `npm run build`
+      (tsc + vite) green; CI builds both. **Playwright E2E** (`frontend/e2e/`, 7
+      tests) drives the real app — every view renders correctly, navigation and the
+      create-job form work — validated visually against a live seeded instance.
 
 **Deviations / deferrals:** pip + venv (not `uv`); **Alembic still deferred**
 (schema via `create_all` + raw DDL). UI uses hand-written Tailwind components

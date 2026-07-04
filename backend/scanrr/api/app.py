@@ -13,7 +13,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 from sqlmodel import Session
@@ -218,7 +218,14 @@ async def events(request: Request) -> StreamingResponse:
     return StreamingResponse(stream(), media_type="text/event-stream")
 
 
-# --- static SPA (must be mounted last so /api/* wins) ----------------------- #
+# --- static SPA (declared last so /api/* routes win) ------------------------ #
 
 if FRONTEND_DIST.is_dir():
-    app.mount("/", StaticFiles(directory=str(FRONTEND_DIST), html=True), name="spa")
+    app.mount("/assets", StaticFiles(directory=str(FRONTEND_DIST / "assets")), name="assets")
+
+    @app.get("/{full_path:path}")
+    async def spa(full_path: str) -> FileResponse:
+        """Serve index.html for any non-API path so client-side routes deep-link."""
+        if full_path.startswith("api/"):
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "not found")
+        return FileResponse(FRONTEND_DIST / "index.html")

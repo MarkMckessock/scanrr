@@ -38,7 +38,10 @@ export default function Detections() {
               <Fragment key={d.id}>
                 <tr className="border-b border-slate-800/60">
                   <td className="px-4 py-2 font-mono text-xs text-slate-300">
-                    <button className="hover:text-white" onClick={() => setExpanded(expanded === d.id ? null : d.id)}>
+                    <button
+                      className="text-left hover:text-white"
+                      onClick={() => setExpanded(expanded === d.id ? null : d.id)}
+                    >
                       {d.path}
                     </button>
                   </td>

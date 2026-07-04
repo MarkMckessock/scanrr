@@ -13,6 +13,12 @@ node_modules/
 dist/
 .vite/
 
+# Playwright artifacts
+screens/
+test-results/
+playwright-report/
+.output/
+
 # Data / secrets
 *.db
 *.db-wal
