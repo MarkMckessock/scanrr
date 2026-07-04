@@ -78,3 +78,28 @@ class DetectorStatus(StrEnum):
     OK = "ok"
     CORRUPT = "corrupt"
     ERROR = "error"
+
+
+class ArrType(StrEnum):
+    SONARR = "sonarr"
+    RADARR = "radarr"
+
+
+class MediaType(StrEnum):
+    EPISODE = "episode"
+    MOVIE = "movie"
+
+
+class ReplacementStatus(StrEnum):
+    PENDING_APPROVAL = "pending_approval"
+    APPROVED = "approved"
+    REJECTED = "rejected"
+    REQUESTED = "requested"
+    SEARCHING = "searching"
+    GRABBED = "grabbed"
+    IMPORTED = "imported"
+    VERIFYING = "verifying"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+    EXHAUSTED = "exhausted"
+    ABORTED = "aborted"

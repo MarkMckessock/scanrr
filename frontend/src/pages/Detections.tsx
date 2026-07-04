@@ -15,6 +15,10 @@ export default function Detections() {
     mutationFn: (v: { id: number; action: string }) => api.triage(v.id, v.action),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["detections"] }),
   });
+  const replace = useMutation({
+    mutationFn: (id: number) => api.replaceDetection(id),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["replacements"] }),
+  });
 
   return (
     <div className="space-y-6">
@@ -51,6 +55,9 @@ export default function Detections() {
                   </td>
                   <td className="px-4 py-2">
                     <div className="flex gap-2">
+                      <Button variant="primary" onClick={() => replace.mutate(d.id)}>
+                        Replace
+                      </Button>
                       <Button onClick={() => triage.mutate({ id: d.id, action: "acknowledge" })}>Ack</Button>
                       <Button onClick={() => triage.mutate({ id: d.id, action: "resolve" })}>Resolve</Button>
                       <Button onClick={() => triage.mutate({ id: d.id, action: "ignore" })}>Ignore</Button>

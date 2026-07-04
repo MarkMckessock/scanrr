@@ -14,25 +14,32 @@ from dataclasses import dataclass
 
 from sqlmodel import Session, col, select
 
-from scanrr.core import clock
+from scanrr.core import clock, crypto
 from scanrr.core.config import RuntimeConfig
 from scanrr.core.logging import decision
 from scanrr.db.models import (
+    ArrInstance,
     Detection,
     File,
+    FileArrLink,
     Job,
     JobRun,
+    PathMapping,
+    Replacement,
     RunFile,
     ScanResult,
     ScanTask,
     ScanTaskSubscriber,
 )
 from scanrr.enums import (
+    ArrType,
     DetectionStatus,
     DetectorBackend,
     DetectorStatus,
     Disposition,
     JobType,
+    MediaType,
+    ReplacementStatus,
     RunStatus,
     RunTrigger,
     TaskStatus,
@@ -164,33 +171,103 @@ def _record(
     session.add(rf)
 
 
-def discover(session: Session, job: Job, run: JobRun, config: RuntimeConfig) -> None:
-    """Phase A — stat-only: skip or enqueue each media file (SPEC §3)."""
+@dataclass
+class ArrCandidate:
+    """A media file discovered via an arr instance (path already mapped to local)."""
+
+    local_path: str
+    media_type: MediaType
+    media_id: int
+    arr_file_id: int
+    arr_instance_id: int
+
+
+def _ensure_file(session: Session, path: str) -> File:
+    """Get-or-create a File row by path (hash filled later by the worker)."""
+    f = _get_file(session, path)
+    if f is None:
+        f = File(path=path)
+        session.add(f)
+        session.flush()
+    return f
+
+
+def _link_arr(session: Session, path: str, cand: ArrCandidate) -> None:
+    file = _ensure_file(session, path)
+    assert file.id is not None
+    link = session.get(FileArrLink, (file.id, cand.arr_instance_id))
+    if link is None:
+        link = FileArrLink(file_id=file.id, arr_instance_id=cand.arr_instance_id)
+    link.media_type = cand.media_type
+    link.media_id = cand.media_id
+    link.arr_file_id = cand.arr_file_id
+    session.add(link)
+
+
+def _consider(
+    session: Session,
+    run_id: int,
+    ttl_seconds: int,
+    path: str,
+    st: os.stat_result,
+    config: RuntimeConfig,
+    cand: ArrCandidate | None,
+) -> None:
+    """Apply the §3 stat-only decision to one candidate file."""
+    if time.time() - st.st_mtime < config.min_file_age_seconds:  # 0. stability gate
+        _record(session, run_id, path, Disposition.SKIPPED_TOO_FRESH)
+        decision("skipped", path=path, reason=Disposition.SKIPPED_TOO_FRESH)
+        return
+    f = _get_file(session, path)  # 1. TTL fast-path (global last_scanned_at)
+    if (
+        f is not None
+        and f.size_bytes == st.st_size
+        and f.mtime == st.st_mtime
+        and f.last_scanned_at is not None
+        and clock.age_seconds(f.last_scanned_at) < ttl_seconds
+    ):
+        _record(session, run_id, path, Disposition.SKIPPED_TTL)
+        decision("skipped", path=path, reason=Disposition.SKIPPED_TTL)
+        if cand is not None:
+            _link_arr(session, path, cand)
+        return
+    task = queue.enqueue_or_subscribe(session, path, run_id)  # 2. enqueue + subscribe
+    _record(session, run_id, path, Disposition.QUEUED, task.id)
+    if cand is not None:
+        _link_arr(session, path, cand)
+
+
+def discover(
+    session: Session,
+    job: Job,
+    run: JobRun,
+    config: RuntimeConfig,
+    arr_candidates: list[ArrCandidate] | None = None,
+) -> None:
+    """Phase A — stat-only: skip or enqueue each media file (SPEC §3, §9).
+
+    Path jobs walk the configured directory; arr jobs receive already-mapped local
+    candidates (enumeration + path mapping happens in the orchestrator, off the DB
+    thread) and additionally record the arr linkage for remediation.
+    """
     assert run.id is not None
-    root: str = json.loads(job.config)["root_path"]
     discovered = 0
-    for path, st in walk_media(root, config.media_extensions, config.min_file_size_bytes):
-        discovered += 1
-        # 0. stability gate
-        if time.time() - st.st_mtime < config.min_file_age_seconds:
-            _record(session, run.id, path, Disposition.SKIPPED_TOO_FRESH)
-            decision("skipped", path=path, reason=Disposition.SKIPPED_TOO_FRESH)
-            continue
-        # 1. TTL fast-path (global last_scanned_at)
-        f = _get_file(session, path)
-        if (
-            f is not None
-            and f.size_bytes == st.st_size
-            and f.mtime == st.st_mtime
-            and f.last_scanned_at is not None
-            and clock.age_seconds(f.last_scanned_at) < job.ttl_seconds
+    if arr_candidates is None:
+        for path, st in walk_media(
+            json.loads(job.config)["root_path"],
+            config.media_extensions,
+            config.min_file_size_bytes,
         ):
-            _record(session, run.id, path, Disposition.SKIPPED_TTL)
-            decision("skipped", path=path, reason=Disposition.SKIPPED_TTL)
-            continue
-        # 2. enqueue on the shared queue (dedup by path) + subscribe
-        task = queue.enqueue_or_subscribe(session, path, run.id)
-        _record(session, run.id, path, Disposition.QUEUED, task.id)
+            discovered += 1
+            _consider(session, run.id, job.ttl_seconds, path, st, config, None)
+    else:
+        for cand in arr_candidates:
+            try:
+                st = os.stat(cand.local_path)
+            except OSError:
+                continue  # vanished between enumeration and now
+            discovered += 1
+            _consider(session, run.id, job.ttl_seconds, cand.local_path, st, config, cand)
     run.files_discovered = discovered
     session.add(run)
     session.flush()
@@ -293,7 +370,13 @@ def recover_interrupted(session: Session) -> int:
     return len(stuck)
 
 
-def start_run(session: Session, job_id: int, trigger: RunTrigger, config: RuntimeConfig) -> int:
+def start_run(
+    session: Session,
+    job_id: int,
+    trigger: RunTrigger,
+    config: RuntimeConfig,
+    arr_candidates: list[ArrCandidate] | None = None,
+) -> int:
     """Create a run and run Phase A discovery (enqueue). Returns the run id."""
     job = session.get(Job, job_id)
     assert job is not None and job.id is not None
@@ -303,7 +386,7 @@ def start_run(session: Session, job_id: int, trigger: RunTrigger, config: Runtim
     session.add(run)
     session.flush()
     assert run.id is not None
-    discover(session, job, run, config)
+    discover(session, job, run, config, arr_candidates)
     finalize_run_if_done(session, run.id)  # all-skipped runs finalize immediately
     return run.id
 
@@ -670,3 +753,168 @@ def stats(session: Session) -> dict:
         "files_corrupt": corrupt,
         "files_tracked": len(hashes),
     }
+
+
+# --- Sonarr / Radarr (M4) --------------------------------------------------- #
+
+
+@dataclass
+class JobInfo:
+    id: int
+    type: JobType
+    config: str
+
+
+@dataclass
+class ArrInstanceInfo:
+    id: int
+    type: ArrType
+    base_url: str
+    api_key: str  # decrypted — for use, never returned to the API
+
+
+def job_info(session: Session, job_id: int) -> JobInfo | None:
+    job = session.get(Job, job_id)
+    return JobInfo(id=job.id, type=job.type, config=job.config) if job and job.id else None
+
+
+def get_arr_instance_info(session: Session, instance_id: int) -> ArrInstanceInfo | None:
+    inst = session.get(ArrInstance, instance_id)
+    if inst is None or not inst.enabled or inst.id is None:
+        return None
+    return ArrInstanceInfo(
+        id=inst.id, type=inst.type, base_url=inst.base_url, api_key=crypto.decrypt(inst.api_key)
+    )
+
+
+def get_path_mappings(session: Session, instance_id: int) -> list[tuple[str, str]]:
+    rows = session.exec(
+        select(PathMapping).where(PathMapping.arr_instance_id == instance_id)
+    ).all()
+    return [(m.remote_path, m.local_path) for m in rows]
+
+
+def _arr_dict(inst: ArrInstance) -> dict:
+    # NB: never includes api_key.
+    return {
+        "id": inst.id,
+        "type": inst.type,
+        "name": inst.name,
+        "base_url": inst.base_url,
+        "enabled": inst.enabled,
+    }
+
+
+def create_arr_instance(
+    session: Session, *, type: ArrType, name: str, base_url: str, api_key: str
+) -> dict:
+    inst = ArrInstance(type=type, name=name, base_url=base_url, api_key=crypto.encrypt(api_key))
+    session.add(inst)
+    session.flush()
+    return _arr_dict(inst)
+
+
+def list_arr_instances(session: Session) -> list[dict]:
+    rows = session.exec(select(ArrInstance).order_by(col(ArrInstance.id))).all()
+    return [_arr_dict(i) for i in rows]
+
+
+def delete_arr_instance(session: Session, instance_id: int) -> bool:
+    inst = session.get(ArrInstance, instance_id)
+    if inst is None:
+        return False
+    session.delete(inst)
+    return True
+
+
+def _mapping_dict(m: PathMapping) -> dict:
+    return {
+        "id": m.id,
+        "arr_instance_id": m.arr_instance_id,
+        "remote_path": m.remote_path,
+        "local_path": m.local_path,
+    }
+
+
+def create_path_mapping(
+    session: Session, *, arr_instance_id: int, remote_path: str, local_path: str
+) -> dict:
+    m = PathMapping(
+        arr_instance_id=arr_instance_id, remote_path=remote_path, local_path=local_path
+    )
+    session.add(m)
+    session.flush()
+    return _mapping_dict(m)
+
+
+def list_path_mappings(session: Session) -> list[dict]:
+    rows = session.exec(select(PathMapping).order_by(col(PathMapping.id))).all()
+    return [_mapping_dict(m) for m in rows]
+
+
+def delete_path_mapping(session: Session, mapping_id: int) -> bool:
+    m = session.get(PathMapping, mapping_id)
+    if m is None:
+        return False
+    session.delete(m)
+    return True
+
+
+def _replacement_dict(r: Replacement) -> dict:
+    return {
+        "id": r.id,
+        "detection_id": r.detection_id,
+        "attempt": r.attempt,
+        "status": r.status,
+        "media_type": r.media_type,
+        "requested_at": r.requested_at,
+    }
+
+
+def create_replacement(session: Session, detection_id: int) -> dict | None:
+    """Propose a replacement (SPEC §9). Returns None if the detection is unknown or
+    the file has no arr link (nothing to re-request)."""
+    det = session.get(Detection, detection_id)
+    if det is None:
+        return None
+    link = session.exec(
+        select(FileArrLink).where(FileArrLink.file_id == det.file_id)
+    ).first()
+    if link is None:
+        return None
+    repl = Replacement(
+        detection_id=detection_id,
+        arr_instance_id=link.arr_instance_id,
+        media_type=link.media_type,
+        media_id=link.media_id,
+        arr_file_id=link.arr_file_id,
+        status=ReplacementStatus.PENDING_APPROVAL,
+    )
+    session.add(repl)
+    session.flush()
+    return _replacement_dict(repl)
+
+
+def list_replacements(session: Session) -> list[dict]:
+    rows = session.exec(select(Replacement).order_by(col(Replacement.id).desc())).all()
+    return [_replacement_dict(r) for r in rows]
+
+
+def create_arr_job(
+    session: Session,
+    *,
+    name: str,
+    arr_instance_id: int,
+    ttl_seconds: int,
+    schedule_cron: str | None,
+) -> dict:
+    job = Job(
+        name=name,
+        type=JobType.ARR,
+        ttl_seconds=ttl_seconds,
+        schedule_cron=schedule_cron,
+        config=json.dumps({"arr_instance_id": arr_instance_id}),
+    )
+    session.add(job)
+    session.flush()
+    return _job_dict(session, job)

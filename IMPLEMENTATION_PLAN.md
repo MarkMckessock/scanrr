@@ -49,6 +49,16 @@
       tests) drives the real app — every view renders correctly, navigation and the
       create-job form work — validated visually against a live seeded instance.
 
+- [x] **M4 Sonarr/Radarr** — `arr_instances`/`path_mappings`/`file_arr_links`/
+      `replacements` models; Fernet-encrypted API keys (`core/crypto.py`, never
+      returned by the API); async httpx arr clients (kept over pyarr/arrapi — all
+      maintained ones are sync); longest-prefix path mapping; arr enumeration in
+      the orchestrator (off the DB thread) → mapped candidates → discovery +
+      `file_arr_links`; API for instance/mapping CRUD + connection test + manual
+      `POST /detections/:id/replace` (→ pending_approval); Integrations UI page.
+      34 backend tests (path mapping, mocked arr clients, encryption round-trip,
+      full arr-job discovery+link+replace); Integrations page validated visually.
+
 **Deviations / deferrals:** pip + venv (not `uv`); **Alembic still deferred**
 (schema via `create_all` + raw DDL). UI uses hand-written Tailwind components
 (not the shadcn CLI), CSS bars instead of Recharts, and no Playwright yet —

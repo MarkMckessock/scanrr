@@ -55,6 +55,30 @@ export interface Detection {
   error_log: string | null;
 }
 
+export interface ArrInstance {
+  id: number;
+  type: string;
+  name: string;
+  base_url: string;
+  enabled: boolean;
+}
+
+export interface PathMapping {
+  id: number;
+  arr_instance_id: number;
+  remote_path: string;
+  local_path: string;
+}
+
+export interface Replacement {
+  id: number;
+  detection_id: number;
+  attempt: number;
+  status: string;
+  media_type: string | null;
+  requested_at: string | null;
+}
+
 const BASE = "/api";
 
 async function req<T>(path: string, init?: RequestInit): Promise<T> {
@@ -85,5 +109,16 @@ export const api = {
   detections: (status?: string) =>
     req<Detection[]>(`/detections${status ? `?status=${status}` : ""}`),
   triage: (id: number, action: string) => post<{ id: number; status: string }>(`/detections/${id}/${action}`),
+  replaceDetection: (id: number) => post<Replacement>(`/detections/${id}/replace`),
   settings: () => req<Record<string, unknown>>("/settings"),
+  arrInstances: () => req<ArrInstance[]>("/arr-instances"),
+  createArrInstance: (body: { type: string; name: string; base_url: string; api_key: string }) =>
+    post<ArrInstance>("/arr-instances", body),
+  deleteArrInstance: (id: number) => req<{ deleted: number }>(`/arr-instances/${id}`, { method: "DELETE" }),
+  testArrInstance: (id: number) => post<{ ok: boolean; version?: string }>(`/arr-instances/${id}/test`),
+  pathMappings: () => req<PathMapping[]>("/path-mappings"),
+  createPathMapping: (body: { arr_instance_id: number; remote_path: string; local_path: string }) =>
+    post<PathMapping>("/path-mappings", body),
+  deletePathMapping: (id: number) => req<{ deleted: number }>(`/path-mappings/${id}`, { method: "DELETE" }),
+  replacements: () => req<Replacement[]>("/replacements"),
 };

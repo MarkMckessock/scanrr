@@ -10,6 +10,7 @@ shutdown.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from dataclasses import asdict
 
@@ -18,7 +19,8 @@ from sqlmodel import Session
 from scanrr.core.config import RuntimeConfig
 from scanrr.core.events import EventBus
 from scanrr.db.database import Database
-from scanrr.enums import DetectorStatus, RunTrigger, Verdict
+from scanrr.enums import DetectorStatus, JobType, RunTrigger, Verdict
+from scanrr.integrations.arr import apply_path_mapping, make_client
 from scanrr.scanning import engine
 from scanrr.scanning.executor import ScanExecutor
 from scanrr.scanning.integrity import Outcome
@@ -68,13 +70,63 @@ class Orchestrator:
     # --- run control -------------------------------------------------------- #
 
     async def trigger_run(self, job_id: int, trigger: RunTrigger = RunTrigger.SCHEDULED) -> int:
+        def _info(session: Session) -> engine.JobInfo | None:
+            return engine.job_info(session, job_id)
+
+        info = await self.db.run(_info)
+        if info is None:
+            raise ValueError(f"job {job_id} not found")
+        # arr enumeration is network I/O — do it here (async), off the DB thread.
+        candidates = await self._arr_discover(info) if info.type is JobType.ARR else None
+
         def _start(session: Session) -> int:
-            return engine.start_run(session, job_id, trigger, self.config)
+            return engine.start_run(session, job_id, trigger, self.config, candidates)
 
         run_id = await self.db.run(_start)
         await self._publish_run_started(run_id)
         self._wake.set()
         return run_id
+
+    async def _arr_discover(self, info: engine.JobInfo) -> list[engine.ArrCandidate]:
+        """Enumerate an arr instance and map its paths to local candidates (SPEC §9)."""
+        instance_id = int(json.loads(info.config)["arr_instance_id"])
+
+        def _inst(session: Session) -> engine.ArrInstanceInfo | None:
+            return engine.get_arr_instance_info(session, instance_id)
+
+        def _maps(session: Session) -> list[tuple[str, str]]:
+            return engine.get_path_mappings(session, instance_id)
+
+        inst = await self.db.run(_inst)
+        if inst is None:
+            _log.warning("arr instance %d missing/disabled for job %d", instance_id, info.id)
+            return []
+        mappings = await self.db.run(_maps)
+        client = make_client(inst.type, inst.base_url, inst.api_key)
+        try:
+            files = await client.list_media_files()
+        except Exception as exc:
+            _log.error("arr enumeration failed for instance %d: %r", instance_id, exc)
+            return []
+        finally:
+            await client.close()
+
+        candidates: list[engine.ArrCandidate] = []
+        for arr_file in files:
+            local = apply_path_mapping(mappings, arr_file.remote_path)
+            if local is None:
+                _log.warning("no path mapping for %s", arr_file.remote_path)
+                continue
+            candidates.append(
+                engine.ArrCandidate(
+                    local_path=local,
+                    media_type=arr_file.media_type,
+                    media_id=arr_file.media_id,
+                    arr_file_id=arr_file.arr_file_id,
+                    arr_instance_id=instance_id,
+                )
+            )
+        return candidates
 
     def _publish_progress(self, progress: engine.RunProgress) -> None:
         if self._bus is None:

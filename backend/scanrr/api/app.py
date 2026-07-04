@@ -24,7 +24,8 @@ from scanrr.core.logging import configure as configure_logging
 from scanrr.db.database import Database
 from scanrr.db.engine import get_engine, init_db
 from scanrr.db.models import Job
-from scanrr.enums import DetectionStatus, RunTrigger
+from scanrr.enums import ArrType, DetectionStatus, RunTrigger
+from scanrr.integrations.arr import make_client
 from scanrr.jobs.scheduler import Scheduler
 from scanrr.scanning import engine
 from scanrr.scanning.executor import PebbleExecutor
@@ -73,7 +74,8 @@ def _db(request: Request) -> Database:
 
 class JobCreate(BaseModel):
     name: str
-    root_path: str
+    root_path: str | None = None
+    arr_instance_id: int | None = None  # set for an arr job instead of root_path
     ttl_days: int = 30
     schedule_cron: str | None = None
 
@@ -84,6 +86,19 @@ class JobUpdate(BaseModel):
     ttl_seconds: int | None = None
     schedule_cron: str | None = None
     auto_replace: bool | None = None
+
+
+class ArrInstanceCreate(BaseModel):
+    type: ArrType
+    name: str
+    base_url: str
+    api_key: str
+
+
+class PathMappingCreate(BaseModel):
+    arr_instance_id: int
+    remote_path: str
+    local_path: str
 
 
 # --- reads ------------------------------------------------------------------ #
@@ -137,7 +152,21 @@ def get_settings() -> dict:
 
 @app.post("/api/jobs", dependencies=[Depends(require_token)])
 async def create_job(body: JobCreate, request: Request) -> dict:
+    if (body.root_path is None) == (body.arr_instance_id is None):
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST, "provide exactly one of root_path or arr_instance_id"
+        )
+
     def _create(session: Session) -> dict:
+        if body.arr_instance_id is not None:
+            return engine.create_arr_job(
+                session,
+                name=body.name,
+                arr_instance_id=body.arr_instance_id,
+                ttl_seconds=body.ttl_days * 86_400,
+                schedule_cron=body.schedule_cron,
+            )
+        assert body.root_path is not None
         return engine.create_job(
             session,
             name=body.name,
@@ -183,6 +212,17 @@ async def cancel_run(run_id: int, request: Request) -> dict:
     return result
 
 
+@app.post("/api/detections/{det_id}/replace", dependencies=[Depends(require_token)])
+async def replace_detection(det_id: int, request: Request) -> dict:
+    """Propose a replacement (→ pending_approval). Execution lands in M5."""
+    result = await _db(request).run(lambda s: engine.create_replacement(s, det_id))
+    if result is None:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST, "detection not found or file has no arr link"
+        )
+    return result
+
+
 @app.post("/api/detections/{det_id}/{action}", dependencies=[Depends(require_token)])
 async def triage_detection(det_id: int, action: str, request: Request) -> dict:
     new_status = _TRIAGE.get(action)
@@ -192,6 +232,78 @@ async def triage_detection(det_id: int, action: str, request: Request) -> dict:
     if not ok:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "detection not found")
     return {"id": det_id, "status": new_status}
+
+
+# --- Sonarr / Radarr integration (M4) --------------------------------------- #
+
+
+@app.get("/api/arr-instances")
+async def list_arr_instances(request: Request) -> list[dict]:
+    return await _db(request).run(engine.list_arr_instances)
+
+
+@app.post("/api/arr-instances", dependencies=[Depends(require_token)])
+async def create_arr_instance(body: ArrInstanceCreate, request: Request) -> dict:
+    def _create(session: Session) -> dict:
+        return engine.create_arr_instance(
+            session, type=body.type, name=body.name, base_url=body.base_url, api_key=body.api_key
+        )
+
+    return await _db(request).run(_create)
+
+
+@app.delete("/api/arr-instances/{instance_id}", dependencies=[Depends(require_token)])
+async def delete_arr_instance(instance_id: int, request: Request) -> dict:
+    ok = await _db(request).run(lambda s: engine.delete_arr_instance(s, instance_id))
+    if not ok:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "instance not found")
+    return {"deleted": instance_id}
+
+
+@app.post("/api/arr-instances/{instance_id}/test", dependencies=[Depends(require_token)])
+async def test_arr_instance(instance_id: int, request: Request) -> dict:
+    inst = await _db(request).run(lambda s: engine.get_arr_instance_info(s, instance_id))
+    if inst is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "instance not found or disabled")
+    client = make_client(inst.type, inst.base_url, inst.api_key)
+    try:
+        info = await client.test()
+        return {"ok": True, "version": info.get("version")}
+    except Exception as exc:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, f"connection failed: {exc}") from exc
+    finally:
+        await client.close()
+
+
+@app.get("/api/path-mappings")
+async def list_path_mappings(request: Request) -> list[dict]:
+    return await _db(request).run(engine.list_path_mappings)
+
+
+@app.post("/api/path-mappings", dependencies=[Depends(require_token)])
+async def create_path_mapping(body: PathMappingCreate, request: Request) -> dict:
+    def _create(session: Session) -> dict:
+        return engine.create_path_mapping(
+            session,
+            arr_instance_id=body.arr_instance_id,
+            remote_path=body.remote_path,
+            local_path=body.local_path,
+        )
+
+    return await _db(request).run(_create)
+
+
+@app.delete("/api/path-mappings/{mapping_id}", dependencies=[Depends(require_token)])
+async def delete_path_mapping(mapping_id: int, request: Request) -> dict:
+    ok = await _db(request).run(lambda s: engine.delete_path_mapping(s, mapping_id))
+    if not ok:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "mapping not found")
+    return {"deleted": mapping_id}
+
+
+@app.get("/api/replacements")
+async def list_replacements(request: Request) -> list[dict]:
+    return await _db(request).run(engine.list_replacements)
 
 
 # --- realtime --------------------------------------------------------------- #
