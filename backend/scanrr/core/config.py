@@ -54,8 +54,6 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
     # Shared secret required on mutating API routes (SPEC §11/§14). Empty = off (dev).
     api_token: str = ""
-    # Fernet key for encrypting secrets at rest (SPEC §14). Empty = insecure dev key.
-    encryption_key: str = ""
 
 
 settings = Settings()

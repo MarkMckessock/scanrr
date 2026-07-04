@@ -36,12 +36,11 @@ test("run detail shows per-file outcomes", async ({ page }) => {
   await page.screenshot({ path: shot("run-detail"), fullPage: true });
 });
 
-test("integrations page renders arr instance + path mapping forms", async ({ page }) => {
+test("integrations page shows YAML arr instances read-only", async ({ page }) => {
   await page.goto("/integrations");
   await expect(page.getByRole("heading", { name: "Integrations" })).toBeVisible();
-  await expect(page.getByText("Sonarr / Radarr instances")).toBeVisible();
-  await expect(page.getByText("Path mappings")).toBeVisible();
-  await expect(page.getByPlaceholder("http://sonarr:8989")).toBeVisible();
+  await expect(page.getByText(/read-only here/)).toBeVisible();
+  await expect(page.getByText("Path mappings").first()).toBeVisible();
   await page.screenshot({ path: "screens/integrations.png", fullPage: true });
 });
 

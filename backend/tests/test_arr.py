@@ -11,6 +11,7 @@ from specs import arr_spec
 from sqlmodel import Session, select
 
 from scanrr.core.config import RuntimeConfig
+from scanrr.core.fileconfig import ArrInstanceSpec
 from scanrr.db import engine as db_engine
 from scanrr.db.database import Database
 from scanrr.db.models import Detection, FileArrLink, Replacement
@@ -81,23 +82,6 @@ async def test_radarr_enumerates_movie_files():
     assert files[0].media_id == 3 and files[0].arr_file_id == 55
 
 
-# --- encryption round-trip -------------------------------------------------- #
-
-
-def test_arr_instance_api_key_encrypted(eng):
-    from scanrr.core import crypto
-    from scanrr.db.models import ArrInstance
-
-    with Session(eng) as s:
-        engine.create_arr_instance(
-            s, type=ArrType.RADARR, name="R", base_url="http://r", api_key="topsecret"
-        )
-        s.commit()
-        stored = s.exec(select(ArrInstance)).one()
-        assert stored.api_key != "topsecret"  # encrypted at rest
-        assert crypto.decrypt(stored.api_key) == "topsecret"
-
-
 # --- arr-job discovery + linking (full run) --------------------------------- #
 
 
@@ -107,16 +91,14 @@ async def test_arr_job_discovers_maps_and_links(eng, media, tmp_path, monkeypatc
     shutil.copy(media["clean"], lib / "good.mkv")
     shutil.copy(media["bitflip"], lib / "bad.mkv")
 
-    with Session(eng) as s:
-        inst = engine.create_arr_instance(
-            s, type=ArrType.RADARR, name="R", base_url="http://r", api_key="k"
-        )
-        engine.create_path_mapping(
-            s, arr_instance_id=inst["id"], remote_path="/data/movies", local_path=str(lib)
-        )
-        s.commit()
-        instance_id = inst["id"]
-    spec = arr_spec(instance_id, name="Movies")
+    inst = ArrInstanceSpec(
+        name="radarr-main",
+        type=ArrType.RADARR,
+        url="http://r",
+        api_key="k",
+        mappings=(("/data/movies", str(lib)),),
+    )
+    spec = arr_spec("radarr-main", name="Movies")
 
     class FakeClient:
         async def list_media_files(self):
@@ -133,7 +115,12 @@ async def test_arr_job_discovers_maps_and_links(eng, media, tmp_path, monkeypatc
     )
 
     orch = Orchestrator(
-        Database(eng), InlineExecutor(), CFG, yaml_jobs={spec.slug: spec}, poll_interval=0.02
+        Database(eng),
+        InlineExecutor(),
+        CFG,
+        yaml_jobs={spec.slug: spec},
+        arr_instances={inst.name: inst},
+        poll_interval=0.02,
     )
     await orch.start()
     try:

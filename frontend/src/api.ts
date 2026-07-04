@@ -57,19 +57,16 @@ export interface Detection {
   error_log: string | null;
 }
 
-export interface ArrInstance {
-  id: number;
-  type: string;
-  name: string;
-  base_url: string;
-  enabled: boolean;
+export interface ArrMapping {
+  from: string;
+  to: string;
 }
 
-export interface PathMapping {
-  id: number;
-  arr_instance_id: number;
-  remote_path: string;
-  local_path: string;
+export interface ArrInstance {
+  name: string;
+  type: string;
+  url: string;
+  mappings: ArrMapping[];
 }
 
 export interface Replacement {
@@ -109,13 +106,7 @@ export const api = {
   replaceDetection: (id: number) => post<Replacement>(`/detections/${id}/replace`),
   settings: () => req<Record<string, unknown>>("/settings"),
   arrInstances: () => req<ArrInstance[]>("/arr-instances"),
-  createArrInstance: (body: { type: string; name: string; base_url: string; api_key: string }) =>
-    post<ArrInstance>("/arr-instances", body),
-  deleteArrInstance: (id: number) => req<{ deleted: number }>(`/arr-instances/${id}`, { method: "DELETE" }),
-  testArrInstance: (id: number) => post<{ ok: boolean; version?: string }>(`/arr-instances/${id}/test`),
-  pathMappings: () => req<PathMapping[]>("/path-mappings"),
-  createPathMapping: (body: { arr_instance_id: number; remote_path: string; local_path: string }) =>
-    post<PathMapping>("/path-mappings", body),
-  deletePathMapping: (id: number) => req<{ deleted: number }>(`/path-mappings/${id}`, { method: "DELETE" }),
+  testArrInstance: (name: string) =>
+    post<{ ok: boolean; version?: string }>(`/arr-instances/${name}/test`),
   replacements: () => req<Replacement[]>("/replacements"),
 };

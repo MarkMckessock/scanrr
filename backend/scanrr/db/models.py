@@ -13,7 +13,6 @@ from sqlmodel import Field, SQLModel
 from scanrr.core import clock
 from scanrr.db.columns import enum_col
 from scanrr.enums import (
-    ArrType,
     DetectionStatus,
     DetectorBackend,
     Disposition,
@@ -136,29 +135,13 @@ class Detection(SQLModel, table=True):
 # --- Sonarr / Radarr integration (SPEC §8, §9) ------------------------------ #
 
 
-class ArrInstance(SQLModel, table=True):
-    __tablename__ = "arr_instances"
-    id: int | None = Field(default=None, primary_key=True)
-    type: ArrType = Field(sa_column=enum_col(ArrType))
-    name: str
-    base_url: str
-    api_key: str  # encrypted at rest (scanrr.core.crypto)
-    enabled: bool = True
-    created_at: str = Field(default_factory=clock.iso_now)
-
-
-class PathMapping(SQLModel, table=True):
-    __tablename__ = "path_mappings"
-    id: int | None = Field(default=None, primary_key=True)
-    arr_instance_id: int = Field(foreign_key="arr_instances.id", index=True)
-    remote_path: str  # arr's namespace, e.g. /data/media/tv
-    local_path: str  # scanrr's mount, e.g. /mnt/tv
+# arr instances are defined in the YAML config (in memory) — no DB table.
 
 
 class FileArrLink(SQLModel, table=True):
     __tablename__ = "file_arr_links"
     file_id: int = Field(foreign_key="files.id", primary_key=True)
-    arr_instance_id: int = Field(foreign_key="arr_instances.id", primary_key=True)
+    arr_instance: str = Field(primary_key=True)  # YAML arr instance name (not an FK)
     media_type: MediaType = Field(sa_column=enum_col(MediaType))
     media_id: int  # series/episode or movie id
     arr_file_id: int  # episodeFile / movieFile id
@@ -169,7 +152,7 @@ class Replacement(SQLModel, table=True):
     id: int | None = Field(default=None, primary_key=True)
     detection_id: int = Field(foreign_key="detections.id", index=True)
     attempt: int = 1
-    arr_instance_id: int | None = Field(default=None, foreign_key="arr_instances.id")
+    arr_instance: str | None = None  # YAML arr instance name
     media_type: MediaType | None = Field(default=None, sa_column=enum_col(MediaType, nullable=True))
     media_id: int | None = None
     arr_file_id: int | None = None

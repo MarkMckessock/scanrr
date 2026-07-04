@@ -14,17 +14,15 @@ from dataclasses import dataclass
 
 from sqlmodel import Session, col, select
 
-from scanrr.core import clock, crypto
+from scanrr.core import clock
 from scanrr.core.config import RuntimeConfig
 from scanrr.core.fileconfig import JobSpec
 from scanrr.core.logging import decision
 from scanrr.db.models import (
-    ArrInstance,
     Detection,
     File,
     FileArrLink,
     JobRun,
-    PathMapping,
     Replacement,
     RunFile,
     ScanResult,
@@ -32,7 +30,6 @@ from scanrr.db.models import (
     ScanTaskSubscriber,
 )
 from scanrr.enums import (
-    ArrType,
     DetectionStatus,
     DetectorBackend,
     DetectorStatus,
@@ -178,7 +175,7 @@ class ArrCandidate:
     media_type: MediaType
     media_id: int
     arr_file_id: int
-    arr_instance_id: int
+    arr_instance: str  # YAML arr instance name
 
 
 def _ensure_file(session: Session, path: str) -> File:
@@ -194,9 +191,9 @@ def _ensure_file(session: Session, path: str) -> File:
 def _link_arr(session: Session, path: str, cand: ArrCandidate) -> None:
     file = _ensure_file(session, path)
     assert file.id is not None
-    link = session.get(FileArrLink, (file.id, cand.arr_instance_id))
+    link = session.get(FileArrLink, (file.id, cand.arr_instance))
     if link is None:
-        link = FileArrLink(file_id=file.id, arr_instance_id=cand.arr_instance_id)
+        link = FileArrLink(file_id=file.id, arr_instance=cand.arr_instance)
     link.media_type = cand.media_type
     link.media_id = cand.media_id
     link.arr_file_id = cand.arr_file_id
@@ -610,7 +607,7 @@ def _job_dict(session: Session, spec: JobSpec) -> dict:
         "ttl_seconds": spec.ttl_seconds,
         "schedule_cron": spec.schedule_cron,
         "root_path": config.get("root_path"),
-        "arr_instance_id": config.get("arr_instance_id"),
+        "arr_instance": config.get("arr_instance"),
         "auto_replace": spec.auto_replace,
         "last_run": None
         if last is None
@@ -721,97 +718,7 @@ def stats(session: Session) -> dict:
     }
 
 
-# --- Sonarr / Radarr (M4) --------------------------------------------------- #
-
-
-@dataclass
-class ArrInstanceInfo:
-    id: int
-    type: ArrType
-    base_url: str
-    api_key: str  # decrypted — for use, never returned to the API
-
-
-def get_arr_instance_info(session: Session, instance_id: int) -> ArrInstanceInfo | None:
-    inst = session.get(ArrInstance, instance_id)
-    if inst is None or not inst.enabled or inst.id is None:
-        return None
-    return ArrInstanceInfo(
-        id=inst.id, type=inst.type, base_url=inst.base_url, api_key=crypto.decrypt(inst.api_key)
-    )
-
-
-def get_path_mappings(session: Session, instance_id: int) -> list[tuple[str, str]]:
-    rows = session.exec(
-        select(PathMapping).where(PathMapping.arr_instance_id == instance_id)
-    ).all()
-    return [(m.remote_path, m.local_path) for m in rows]
-
-
-def _arr_dict(inst: ArrInstance) -> dict:
-    # NB: never includes api_key.
-    return {
-        "id": inst.id,
-        "type": inst.type,
-        "name": inst.name,
-        "base_url": inst.base_url,
-        "enabled": inst.enabled,
-    }
-
-
-def create_arr_instance(
-    session: Session, *, type: ArrType, name: str, base_url: str, api_key: str
-) -> dict:
-    inst = ArrInstance(type=type, name=name, base_url=base_url, api_key=crypto.encrypt(api_key))
-    session.add(inst)
-    session.flush()
-    return _arr_dict(inst)
-
-
-def list_arr_instances(session: Session) -> list[dict]:
-    rows = session.exec(select(ArrInstance).order_by(col(ArrInstance.id))).all()
-    return [_arr_dict(i) for i in rows]
-
-
-def delete_arr_instance(session: Session, instance_id: int) -> bool:
-    inst = session.get(ArrInstance, instance_id)
-    if inst is None:
-        return False
-    session.delete(inst)
-    return True
-
-
-def _mapping_dict(m: PathMapping) -> dict:
-    return {
-        "id": m.id,
-        "arr_instance_id": m.arr_instance_id,
-        "remote_path": m.remote_path,
-        "local_path": m.local_path,
-    }
-
-
-def create_path_mapping(
-    session: Session, *, arr_instance_id: int, remote_path: str, local_path: str
-) -> dict:
-    m = PathMapping(
-        arr_instance_id=arr_instance_id, remote_path=remote_path, local_path=local_path
-    )
-    session.add(m)
-    session.flush()
-    return _mapping_dict(m)
-
-
-def list_path_mappings(session: Session) -> list[dict]:
-    rows = session.exec(select(PathMapping).order_by(col(PathMapping.id))).all()
-    return [_mapping_dict(m) for m in rows]
-
-
-def delete_path_mapping(session: Session, mapping_id: int) -> bool:
-    m = session.get(PathMapping, mapping_id)
-    if m is None:
-        return False
-    session.delete(m)
-    return True
+# --- Sonarr / Radarr remediation (arr instances are defined in YAML) -------- #
 
 
 def _replacement_dict(r: Replacement) -> dict:
@@ -838,7 +745,7 @@ def create_replacement(session: Session, detection_id: int) -> dict | None:
         return None
     repl = Replacement(
         detection_id=detection_id,
-        arr_instance_id=link.arr_instance_id,
+        arr_instance=link.arr_instance,
         media_type=link.media_type,
         media_id=link.media_id,
         arr_file_id=link.arr_file_id,

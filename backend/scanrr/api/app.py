@@ -15,7 +15,6 @@ from pathlib import Path
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
 from sqlmodel import Session
 
 from scanrr.core.config import DEFAULTS, settings
@@ -24,7 +23,7 @@ from scanrr.core.fileconfig import load_file_config
 from scanrr.core.logging import configure as configure_logging
 from scanrr.db.database import Database
 from scanrr.db.engine import get_engine, init_db
-from scanrr.enums import ArrType, DetectionStatus, RunTrigger
+from scanrr.enums import DetectionStatus, RunTrigger
 from scanrr.integrations.arr import make_client
 from scanrr.jobs.scheduler import Scheduler
 from scanrr.scanning import engine
@@ -45,19 +44,26 @@ async def lifespan(app: FastAPI):
     configure_logging()
     init_db()
     # YAML config (settings override + in-memory jobs) is the IaC source of truth.
-    config, yaml_specs = load_file_config(settings.config_file, DEFAULTS)
-    yaml_registry = {spec.slug: spec for spec in yaml_specs}
+    fc = load_file_config(settings.config_file, DEFAULTS)
+    yaml_registry = {spec.slug: spec for spec in fc.jobs}
+    arr_registry = {inst.name: inst for inst in fc.arr_instances}
     db = Database(get_engine())
     bus = EventBus()
     orchestrator = Orchestrator(
-        db, PebbleExecutor(config.max_scan_workers), config, bus=bus, yaml_jobs=yaml_registry
+        db,
+        PebbleExecutor(fc.config.max_scan_workers),
+        fc.config,
+        bus=bus,
+        yaml_jobs=yaml_registry,
+        arr_instances=arr_registry,
     )
     await orchestrator.start()
-    scheduler = Scheduler(orchestrator, db, config, yaml_jobs=yaml_specs)
+    scheduler = Scheduler(orchestrator, db, fc.config, yaml_jobs=fc.jobs)
     await scheduler.start()
     app.state.db, app.state.bus = db, bus
     app.state.orchestrator, app.state.scheduler = orchestrator, scheduler
-    app.state.config, app.state.yaml_specs = config, yaml_specs
+    app.state.config, app.state.yaml_specs = fc.config, fc.jobs
+    app.state.arr_instances = fc.arr_instances
     try:
         yield
     finally:
@@ -76,19 +82,6 @@ def require_token(x_scanrr_token: str | None = Header(default=None)) -> None:
 
 def _db(request: Request) -> Database:
     return request.app.state.db
-
-
-class ArrInstanceCreate(BaseModel):
-    type: ArrType
-    name: str
-    base_url: str
-    api_key: str
-
-
-class PathMappingCreate(BaseModel):
-    arr_instance_id: int
-    remote_path: str
-    local_path: str
 
 
 # --- reads ------------------------------------------------------------------ #
@@ -190,38 +183,29 @@ async def triage_detection(det_id: int, action: str, request: Request) -> dict:
     return {"id": det_id, "status": new_status}
 
 
-# --- Sonarr / Radarr integration (M4) --------------------------------------- #
+# --- Sonarr / Radarr (defined in YAML — read-only) -------------------------- #
+
+
+def _arr_dict(inst) -> dict:  # never includes api_key
+    return {
+        "name": inst.name,
+        "type": inst.type,
+        "url": inst.url,
+        "mappings": [{"from": remote, "to": local} for remote, local in inst.mappings],
+    }
 
 
 @app.get("/api/arr-instances")
-async def list_arr_instances(request: Request) -> list[dict]:
-    return await _db(request).run(engine.list_arr_instances)
+def list_arr_instances(request: Request) -> list[dict]:
+    return [_arr_dict(inst) for inst in request.app.state.arr_instances]
 
 
-@app.post("/api/arr-instances", dependencies=[Depends(require_token)])
-async def create_arr_instance(body: ArrInstanceCreate, request: Request) -> dict:
-    def _create(session: Session) -> dict:
-        return engine.create_arr_instance(
-            session, type=body.type, name=body.name, base_url=body.base_url, api_key=body.api_key
-        )
-
-    return await _db(request).run(_create)
-
-
-@app.delete("/api/arr-instances/{instance_id}", dependencies=[Depends(require_token)])
-async def delete_arr_instance(instance_id: int, request: Request) -> dict:
-    ok = await _db(request).run(lambda s: engine.delete_arr_instance(s, instance_id))
-    if not ok:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "instance not found")
-    return {"deleted": instance_id}
-
-
-@app.post("/api/arr-instances/{instance_id}/test", dependencies=[Depends(require_token)])
-async def test_arr_instance(instance_id: int, request: Request) -> dict:
-    inst = await _db(request).run(lambda s: engine.get_arr_instance_info(s, instance_id))
+@app.post("/api/arr-instances/{name}/test", dependencies=[Depends(require_token)])
+async def test_arr_instance(name: str, request: Request) -> dict:
+    inst = next((a for a in request.app.state.arr_instances if a.name == name), None)
     if inst is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "instance not found or disabled")
-    client = make_client(inst.type, inst.base_url, inst.api_key)
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "instance not found")
+    client = make_client(inst.type, inst.url, inst.api_key)
     try:
         info = await client.test()
         return {"ok": True, "version": info.get("version")}
@@ -229,32 +213,6 @@ async def test_arr_instance(instance_id: int, request: Request) -> dict:
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, f"connection failed: {exc}") from exc
     finally:
         await client.close()
-
-
-@app.get("/api/path-mappings")
-async def list_path_mappings(request: Request) -> list[dict]:
-    return await _db(request).run(engine.list_path_mappings)
-
-
-@app.post("/api/path-mappings", dependencies=[Depends(require_token)])
-async def create_path_mapping(body: PathMappingCreate, request: Request) -> dict:
-    def _create(session: Session) -> dict:
-        return engine.create_path_mapping(
-            session,
-            arr_instance_id=body.arr_instance_id,
-            remote_path=body.remote_path,
-            local_path=body.local_path,
-        )
-
-    return await _db(request).run(_create)
-
-
-@app.delete("/api/path-mappings/{mapping_id}", dependencies=[Depends(require_token)])
-async def delete_path_mapping(mapping_id: int, request: Request) -> dict:
-    ok = await _db(request).run(lambda s: engine.delete_path_mapping(s, mapping_id))
-    if not ok:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "mapping not found")
-    return {"deleted": mapping_id}
 
 
 @app.get("/api/replacements")

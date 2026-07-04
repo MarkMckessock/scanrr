@@ -18,7 +18,7 @@ from sqlmodel import Session
 
 from scanrr.core.config import RuntimeConfig
 from scanrr.core.events import EventBus
-from scanrr.core.fileconfig import JobSpec
+from scanrr.core.fileconfig import ArrInstanceSpec, JobSpec
 from scanrr.db.database import Database
 from scanrr.enums import DetectorStatus, JobType, RunTrigger, Verdict
 from scanrr.integrations.arr import apply_path_mapping, make_client
@@ -38,6 +38,7 @@ class Orchestrator:
         *,
         bus: EventBus | None = None,
         yaml_jobs: dict[str, JobSpec] | None = None,
+        arr_instances: dict[str, ArrInstanceSpec] | None = None,
         poll_interval: float = 0.5,
     ) -> None:
         self.db = db
@@ -45,6 +46,7 @@ class Orchestrator:
         self.config = config
         self._bus = bus
         self._yaml_jobs: dict[str, JobSpec] = yaml_jobs or {}  # keyed by slug
+        self._arr_instances: dict[str, ArrInstanceSpec] = arr_instances or {}  # keyed by name
         self._poll_interval = poll_interval
         self._max_workers = config.max_scan_workers
         self._inflight: dict[int, asyncio.Task[None]] = {}
@@ -88,29 +90,22 @@ class Orchestrator:
         return run_id
 
     async def _arr_discover(self, spec: JobSpec) -> list[engine.ArrCandidate]:
-        """Enumerate an arr instance and map its paths to local candidates (SPEC §9)."""
-        instance_id = int(json.loads(spec.config)["arr_instance_id"])
-
-        def _inst(session: Session) -> engine.ArrInstanceInfo | None:
-            return engine.get_arr_instance_info(session, instance_id)
-
-        def _maps(session: Session) -> list[tuple[str, str]]:
-            return engine.get_path_mappings(session, instance_id)
-
-        inst = await self.db.run(_inst)
+        """Enumerate a (YAML-defined) arr instance and map its paths locally (SPEC §9)."""
+        name = json.loads(spec.config)["arr_instance"]
+        inst = self._arr_instances.get(name)
         if inst is None:
-            _log.warning("arr instance %d missing/disabled for job %r", instance_id, spec.slug)
+            _log.warning("arr instance %r not defined for job %r", name, spec.slug)
             return []
-        mappings = await self.db.run(_maps)
-        client = make_client(inst.type, inst.base_url, inst.api_key)
+        client = make_client(inst.type, inst.url, inst.api_key)
         try:
             files = await client.list_media_files()
         except Exception as exc:
-            _log.error("arr enumeration failed for instance %d: %r", instance_id, exc)
+            _log.error("arr enumeration failed for instance %r: %r", name, exc)
             return []
         finally:
             await client.close()
 
+        mappings = list(inst.mappings)
         candidates: list[engine.ArrCandidate] = []
         for arr_file in files:
             local = apply_path_mapping(mappings, arr_file.remote_path)
@@ -123,7 +118,7 @@ class Orchestrator:
                     media_type=arr_file.media_type,
                     media_id=arr_file.media_id,
                     arr_file_id=arr_file.arr_file_id,
-                    arr_instance_id=instance_id,
+                    arr_instance=name,
                 )
             )
         return candidates

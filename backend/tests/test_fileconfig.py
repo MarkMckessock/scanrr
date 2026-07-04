@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import shutil
 import textwrap
 
@@ -15,7 +16,7 @@ from scanrr.core.fileconfig import load_file_config, slugify
 from scanrr.db import engine as db_engine
 from scanrr.db.database import Database
 from scanrr.db.models import Detection, JobRun
-from scanrr.enums import JobType, RunStatus
+from scanrr.enums import ArrType, JobType, RunStatus
 from scanrr.scanning.executor import InlineExecutor
 from scanrr.scanning.orchestrator import Orchestrator
 
@@ -42,8 +43,8 @@ def test_slugify_is_deterministic():
 
 
 def test_load_missing_file_is_noop():
-    config, specs = load_file_config("/no/such/file.yaml", DEFAULTS)
-    assert config is DEFAULTS and specs == []
+    fc = load_file_config("/no/such/file.yaml", DEFAULTS)
+    assert fc.config is DEFAULTS and fc.jobs == [] and fc.arr_instances == []
 
 
 def test_load_parses_settings_and_jobs(tmp_path):
@@ -61,17 +62,59 @@ def test_load_parses_settings_and_jobs(tmp_path):
             schedule_cron: "0 3 * * *"
           - name: TV
             type: arr
-            arr_instance_id: 2
+            arr_instance: sonarr-main
         """,
     )
-    config, specs = load_file_config(path, DEFAULTS)
-    assert config.max_scan_workers == 7
-    assert config.detector_backend == "subprocess"
-    assert {s.slug for s in specs} == {"movies", "tv"}
-    movies = next(s for s in specs if s.slug == "movies")
+    fc = load_file_config(path, DEFAULTS)
+    assert fc.config.max_scan_workers == 7
+    assert fc.config.detector_backend == "subprocess"
+    assert {s.slug for s in fc.jobs} == {"movies", "tv"}
+    movies = next(s for s in fc.jobs if s.slug == "movies")
     assert movies.type is JobType.PATH
     assert movies.ttl_seconds == 14 * 86_400
     assert movies.schedule_cron == "0 3 * * *"
+    tv = next(s for s in fc.jobs if s.slug == "tv")
+    assert json.loads(tv.config)["arr_instance"] == "sonarr-main"
+
+
+def test_load_parses_arr_instances(tmp_path):
+    path = _write(
+        tmp_path,
+        """
+        radarr:
+          - name: main
+            url: http://radarr:7878
+            api_key: rkey
+            mappings:
+              - { from: /data/movies, to: /mnt/movies }
+        sonarr:
+          - name: tv
+            url: http://sonarr:8989
+            api_key: skey
+            mappings:
+              - { from: /data/tv, to: /mnt/tv }
+        """,
+    )
+    fc = load_file_config(path, DEFAULTS)
+    assert {a.name for a in fc.arr_instances} == {"main", "tv"}
+    main = next(a for a in fc.arr_instances if a.name == "main")
+    assert main.type is ArrType.RADARR
+    assert main.url == "http://radarr:7878" and main.api_key == "rkey"
+    assert main.mappings == (("/data/movies", "/mnt/movies"),)
+
+
+def test_duplicate_arr_name_rejected(tmp_path):
+    path = _write(
+        tmp_path,
+        """
+        radarr:
+          - { name: dup, url: http://a, api_key: k }
+        sonarr:
+          - { name: dup, url: http://b, api_key: k }
+        """,
+    )
+    with pytest.raises(ValueError):
+        load_file_config(path, DEFAULTS)
 
 
 def test_duplicate_slug_rejected(tmp_path):
@@ -101,8 +144,7 @@ async def test_yaml_job_runs_and_snapshots_onto_the_run(eng, media, tmp_path):
             root_path: {lib}
         """,
     )
-    _, specs = load_file_config(path, DEFAULTS)
-    spec = specs[0]
+    spec = load_file_config(path, DEFAULTS).jobs[0]
 
     orch = Orchestrator(
         Database(eng), InlineExecutor(), CFG, yaml_jobs={spec.slug: spec}, poll_interval=0.02

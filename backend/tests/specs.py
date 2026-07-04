@@ -21,12 +21,12 @@ def path_spec(root, *, name: str = "Test", ttl_seconds: int = 0) -> JobSpec:
     )
 
 
-def arr_spec(arr_instance_id: int, *, name: str = "Arr", ttl_seconds: int = 0) -> JobSpec:
+def arr_spec(arr_instance: str, *, name: str = "Arr", ttl_seconds: int = 0) -> JobSpec:
     return JobSpec(
         slug=slugify(name),
         name=name,
         type=JobType.ARR,
-        config=json.dumps({"arr_instance_id": arr_instance_id}),
+        config=json.dumps({"arr_instance": arr_instance}),
         ttl_seconds=ttl_seconds,
         schedule_cron=None,
         enabled=True,

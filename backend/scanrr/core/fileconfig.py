@@ -16,7 +16,7 @@ from dataclasses import dataclass
 import yaml
 
 from scanrr.core.config import RuntimeConfig
-from scanrr.enums import JobType
+from scanrr.enums import ArrType, JobType
 
 
 @dataclass(frozen=True)
@@ -33,9 +33,39 @@ class JobSpec:
     auto_replace: bool
 
 
+@dataclass(frozen=True)
+class ArrInstanceSpec:
+    """A Sonarr/Radarr instance defined in the YAML config (referenced by name)."""
+
+    name: str
+    type: ArrType
+    url: str
+    api_key: str
+    mappings: tuple[tuple[str, str], ...]  # (remote_prefix, local_prefix)
+
+
 def slugify(name: str) -> str:
     """Deterministic URL/id-safe slug from a job name."""
     return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-") or "job"
+
+
+def _arr_instances_from_yaml(data: dict) -> list[ArrInstanceSpec]:
+    out: list[ArrInstanceSpec] = []
+    for arr_type, key in ((ArrType.SONARR, "sonarr"), (ArrType.RADARR, "radarr")):
+        for entry in data.get(key) or []:
+            mappings = tuple(
+                (m["from"], m["to"]) for m in (entry.get("mappings") or [])
+            )
+            out.append(
+                ArrInstanceSpec(
+                    name=entry["name"],
+                    type=arr_type,
+                    url=entry["url"],
+                    api_key=entry["api_key"],
+                    mappings=mappings,
+                )
+            )
+    return out
 
 
 def _job_spec_from_yaml(entry: dict) -> JobSpec:
@@ -44,7 +74,7 @@ def _job_spec_from_yaml(entry: dict) -> JobSpec:
     if job_type is JobType.PATH:
         config = {"root_path": entry["root_path"]}
     else:
-        config = {"arr_instance_id": int(entry["arr_instance_id"])}
+        config = {"arr_instance": entry["arr_instance"]}  # reference by name
     return JobSpec(
         slug=slugify(name),
         name=name,
@@ -57,10 +87,17 @@ def _job_spec_from_yaml(entry: dict) -> JobSpec:
     )
 
 
-def load_file_config(path: str, base: RuntimeConfig) -> tuple[RuntimeConfig, list[JobSpec]]:
-    """Return (effective runtime config, YAML job specs). Missing file → (base, [])."""
+@dataclass(frozen=True)
+class FileConfig:
+    config: RuntimeConfig
+    jobs: list[JobSpec]
+    arr_instances: list[ArrInstanceSpec]
+
+
+def load_file_config(path: str, base: RuntimeConfig) -> FileConfig:
+    """Parse the YAML config. A missing/empty file yields base config, no jobs/instances."""
     if not path or not os.path.exists(path):
-        return base, []
+        return FileConfig(config=base, jobs=[], arr_instances=[])
 
     with open(path) as fh:
         data = yaml.safe_load(fh) or {}
@@ -68,8 +105,14 @@ def load_file_config(path: str, base: RuntimeConfig) -> tuple[RuntimeConfig, lis
     overrides = data.get("settings") or {}
     effective = RuntimeConfig(**{**base.model_dump(), **overrides})
 
-    specs = [_job_spec_from_yaml(entry) for entry in (data.get("jobs") or [])]
-    slugs = [s.slug for s in specs]
+    jobs = [_job_spec_from_yaml(entry) for entry in (data.get("jobs") or [])]
+    slugs = [j.slug for j in jobs]
     if len(set(slugs)) != len(slugs):
         raise ValueError("duplicate job slug in YAML config (job names must be distinct)")
-    return effective, specs
+
+    arr_instances = _arr_instances_from_yaml(data)
+    names = [a.name for a in arr_instances]
+    if len(set(names)) != len(names):
+        raise ValueError("duplicate arr instance name in YAML config (must be globally unique)")
+
+    return FileConfig(config=effective, jobs=jobs, arr_instances=arr_instances)

@@ -32,7 +32,7 @@ _EXTRA_DDL = [
     "ON scan_task_subscribers(job_run_id)",
     # arr reverse lookup: history/webhook references a file by its arr file id.
     "CREATE INDEX IF NOT EXISTS ix_file_arr_links_arrfile "
-    "ON file_arr_links(arr_instance_id, arr_file_id)",
+    "ON file_arr_links(arr_instance, arr_file_id)",
     "CREATE INDEX IF NOT EXISTS ix_replacements_status ON replacements(status)",
 ]
 
