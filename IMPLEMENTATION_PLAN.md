@@ -75,12 +75,12 @@ provably idempotent and correct — no async, no scheduler, one process.
 - [ ] `jobs/queue.py` — `enqueue`/`active_task`/`subscribe`/`claim_next_pending`
       over `scan_tasks` + `scan_task_subscribers`.
 - [ ] `scanning/engine.py` — the heart:
-  - [ ] **Phase A** discovery decision (§3): stability gate → TTL fast-path →
-        concurrent-dedup subscribe → hash → cache hit → enqueue+subscribe; writes
-        `run_files` dispositions.
-  - [ ] **Phase B** synchronous drain: claim → `scan_file` → write
-        `scan_results`/`files` → `reconcile_detections` → `fan_out` (credit runs,
-        set outcomes) → `maybe_finalize`.
+  - [ ] **Phase A** discovery (§3, **stat-only** — no content reads): stability gate
+        → TTL fast-path → `enqueue_or_subscribe` (dedup by path); writes `run_files`
+        dispositions.
+  - [ ] **Phase B** synchronous drain: claim → **hash** → content-cache check
+        (hit → skip decode) → `scan_file` decode → write `scan_results`/`files` →
+        `reconcile_detections` → `fan_out` (credit runs, set outcomes) → `maybe_finalize`.
   - [ ] `reconcile_detections` (#6): open on corrupt; auto-resolve an open detection
         whose path now scans `ok` under a different hash.
   - [ ] Transient `error`/`timeout` retry policy (#5/#8): back to `pending` w/

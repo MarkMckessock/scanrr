@@ -1,6 +1,6 @@
 # scanrr — Design Specification
 
-> **Status:** Draft v0.2 · **Owner:** Mark Mckessock
+> **Status:** Draft v0.3 · **Owner:** Mark Mckessock
 > This document is the **source of truth** for scanrr's design. Code follows the
 > spec; when they disagree, update the spec first. Decisions marked
 > **[OPEN]** need a call before the affected code is written.
@@ -79,94 +79,102 @@ Work happens in two phases: **discovery** (per run, cheap, decides each file's
 disposition and enqueues only real work) and the **worker** (once per shared
 queue task, does the expensive scan and fans the result out to every subscribed run).
 
-**Phase A — discovery (per run):**
+All full-file reads (hashing **and** decoding) happen in the **worker pool**, so
+they're throttled by `max_scan_workers`. Discovery is deliberately **stat-only** —
+it must not read file contents, or a first scan of a large library would read every
+file in the discovery loop, unthrottled, competing with the workers for NFS bandwidth.
+
+**Phase A — discovery (per run, stat-only, cheap):**
 ```
 for path in discover(job):
     stat = os.stat(path)
 
     # 0. Stability gate — never scan a file that may still be written/importing.
-    if (now - stat.mtime) < min_file_age_seconds:            # default 120s
+    if (now - stat.st_mtime) < min_file_age_seconds:        # default 120s
         record(run, path, "skipped_too_fresh"); continue
 
     f = files.get(path)
 
-    # 1. Cheapest path — no disk read. last_scanned_at is GLOBAL (a scan is a scan
+    # 1. TTL fast-path — no disk read. last_scanned_at is GLOBAL (a scan is a scan
     #    regardless of which job did it); TTL is evaluated against it.
-    if f and f.size == stat.size and f.mtime == stat.mtime
+    if f and f.size_bytes == stat.st_size and f.mtime == stat.st_mtime
            and f.last_scanned_at and (now - f.last_scanned_at) < job.ttl:
         record(run, path, "skipped_ttl"); continue
 
-    # 1.5 Concurrent-dedup — a task for this path is already active: subscribe and
-    #     skip hashing entirely; the result will fan out to us too (§6).
-    if task := active_task(path):
-        subscribe(task, run); record(run, path, "queued", task); continue
-
-    # 2. Content identity — one full read to hash (blake3). Accepts a second full
-    #    read on the eventual cache miss for exact whole-file dedup (#2).
-    h = hash_file(path)
-
-    # 3. Content-addressed cache hit — reused only if the cached verdict is valid
-    #    for the CURRENT detector (version AND backend). A mismatch falls through
-    #    (lazy revalidation, below), NOT a forced library-wide rescan.
-    sr = scan_results.get(h)
-    if sr and sr.detector_version == CURRENT_DETECTOR_VERSION
-           and sr.detector_backend == CURRENT_DETECTOR_BACKEND:
-        files.upsert(path, hash=h, size, mtime, last_scanned_at=now)
-        reconcile_detections(path, h, sr.status, run)     # open/resolve as needed
-        record(run, path, "skipped_hash_cached", outcome=sr.status); continue
-
-    # 4. Cache miss — enqueue on the SHARED queue (dedup by path) carrying the hash,
-    #    and subscribe. The worker (Phase B) does the actual scan.
-    task = enqueue(path, content_hash=h); subscribe(task, run)
+    # 2. Enqueue on the shared queue, deduped by path. active_task() is an
+    #    optimistic check; the ux_scan_tasks_active_path unique index is the real
+    #    guard — on an enqueue race, catch the conflict and subscribe to the winner.
+    task = enqueue_or_subscribe(path, run)    # create+subscribe, or subscribe if active
     record(run, path, "queued", task)
 ```
 
-**Phase B — worker (once per shared task, result fanned out to all subscribers).**
+**Phase B — worker (once per shared task; hash → cache-check → decode → fan-out).**
 The dispatcher (§6) claims the next `pending` task by `seq`, marks it `scanning`,
-and runs the worker. `fan_out(task, outcome)` is the single place every subscribed
-run is credited — it exists so `ok`, `corrupt`, and `unreadable` all converge on
-the same accounting, which is what guarantees runs always finalize (§6).
+and runs the worker. `fan_out` is the single place every subscribed run is credited,
+so `ok`, `corrupt`, and `unreadable` all converge on the same accounting — which is
+what guarantees runs always finalize (§6).
 ```
-task = claim_next_pending()                # by seq; task.status = "scanning"
-result = ffmpeg_integrity_check(task.path, timeout=max_scan_seconds)   # §7
+task = claim_next_pending()                 # by seq; task.status = "scanning"
+h = hash_file(task.path); task.content_hash = h            # blake3, one read (#2)
 
-if result.status in ("ok", "corrupt"):     # deterministic verdict
-    scan_results.upsert(task.content_hash, result, DETECTOR_VERSION, DETECTOR_BACKEND)
-    files.upsert(task.path, hash=task.content_hash, last_scanned_at=now)
+# Content-addressed cache — reuse only if valid for the CURRENT detector (version
+# AND backend). A mismatch is a miss (lazy revalidation, below) — decode, don't
+# force a library-wide rescan. This is where cross-path / outside-TTL dedup lands.
+sr = scan_results.get(h)
+if sr and sr.detector_version == DETECTOR_VERSION and sr.detector_backend == DETECTOR_BACKEND:
+    result = sr                             # cache hit → skip the expensive decode
+else:
+    result = ffmpeg_integrity_check(task.path, timeout=max_scan_seconds)   # §7
+    if result.status in ("ok", "corrupt"):  # cache deterministic verdicts only
+        scan_results.upsert(h, result, DETECTOR_VERSION, DETECTOR_BACKEND)
+
+if result.status in ("ok", "corrupt"):
+    files.upsert(task.path, hash=h, size_bytes=stat.st_size, mtime=stat.st_mtime,
+                 last_scanned_at=now)
     task.status, task.result_status = "done", result.status
-    detection = reconcile_detections(task.path, task.content_hash, result.status)
+    detection = reconcile_detections(task.path, h, result.status)   # open/resolve
     if result.status == "corrupt":
-        enqueue_notification("corrupt_found", path=task.path)   # §10 queue
-    fan_out(task, result.status)
+        enqueue_notification("corrupt_found", path=task.path)       # §10 queue
+    fan_out(task, result.status, detection)
 else:                                       # error / timeout = TRANSIENT
     retry_or_fail(task)                     # NOT cached; back to 'pending' w/ backoff...
     if task.status == "unreadable":         # ...until scan_max_attempts exhausted
-        fan_out(task, "unreadable")
+        fan_out(task, "unreadable", detection=None)
 
-def fan_out(task, outcome):                 # credit EVERY subscribed run
+def fan_out(task, outcome, detection):      # credit EVERY subscribed run
     for run in subscribers(task):
         set_outcome(run, task.path, outcome)             # run_files.outcome
-        if outcome == "corrupt" and run.job.auto_replace:
-            propose_replacement(detection, run.job)       # §9 (approval-gated)
+        if outcome == "corrupt":
+            emit_sse(run, "detection.created", detection)
+            if run.job.auto_replace:
+                propose_replacement(detection, run.job)   # §9 (approval-gated)
         emit_sse(run, "task.updated"); maybe_finalize(run)   # §6 lifecycle step 5
 ```
 
-`reconcile_detections` closes the remediation loop (#6): a `corrupt` verdict opens
-(or reuses) a detection; an `ok` verdict on a path that had an **open detection for
-a different hash** auto-resolves it. So once a file is replaced with a clean copy,
-its old detection clears itself. Replacement proposal is **per subscribing job**
-(a shared task may have subscribers whose jobs differ on `auto_replace`).
-`maybe_finalize` completes a run once its every `run_files` row has a terminal
-disposition/outcome — reached for all three outcomes, so no run is left hanging.
+`reconcile_detections(path, hash, status)` closes the remediation loop (#6): a
+`corrupt` verdict opens (or reuses) the file's detection; an `ok` verdict on a path
+that had an **open detection for a different hash** auto-resolves it. It's called
+once per task (detections are **global to the file**, not per-run); `detections.job_run_id`
+records only the run that *first* surfaced it (informational). Replacement proposal
+is **per subscribing job** (subscribers may differ on `auto_replace`). `maybe_finalize`
+completes a run once every one of its `run_files` rows has a terminal outcome —
+reached for all three outcomes, so no run is left hanging.
 
 **Why this satisfies every requirement:**
 
-- *"Don't re-scan within TTL"* → steps 0–1 (TTL gates the unchanged fast path).
-- *"Skip if hash unchanged"* → steps 1 & 3.
-- *"Skip if hash already recorded under a different path, even outside TTL"* →
-  step 3 skips regardless of TTL, because a hash → verdict is deterministic.
-- *"Idempotent if a scan fails"* → `ok`/`corrupt` tasks are terminal and cached by
-  hash; a re-run skips them in step 1/3. Transient failures retry (below).
+- *"Don't re-scan within TTL"* → Phase A steps 0–1 (TTL gates the stat-only fast path).
+- *"Skip if hash unchanged"* → step 1 (path unchanged) and the worker cache-check.
+- *"Skip if hash already recorded under a different path, even outside TTL"* → the
+  worker cache-check skips the decode regardless of TTL (deterministic hash → verdict).
+- *"Idempotent if a scan fails"* → `ok`/`corrupt` verdicts are cached by hash; a
+  re-run skips the decode. Transient failures retry (below), never poisoning the cache.
+
+Per-run counters on `job_runs` are **derived from `run_files` at finalize** (the
+ledger is authoritative; live progress comes from SSE + count queries). Note the
+global `files_scanned_total` metric (§14a) counts **actual decodes** — one per task —
+so it is *less* than the sum of per-run scanned counts whenever a file is shared by
+overlapping runs. That's intended: the metric measures work done, the counters measure
+per-run coverage.
 
 **Transient errors & retries (#5, #8):** `error` (couldn't open) and `timeout`
 are **not** verdicts — an NFS blip, a lock, or a still-importing file can cause
@@ -180,8 +188,9 @@ most mid-write false errors up front.
 both `detector_version` (bumped when detection logic/args change) and
 `detector_backend`. A mismatch does **not** trigger an immediate library-wide
 re-scan (which could be days of NFS I/O). The cached verdict is shown flagged
-`stale`; the file is only re-scanned when it's next naturally due (TTL / content
-change) or via an explicit, scope-previewed **"Revalidate library"** action.
+`stale` — a **computed** flag (its `detector_version`/`detector_backend` ≠ current),
+not a stored column. The file is only re-scanned when it's next naturally due (TTL /
+content change) or via an explicit, scope-previewed **"Revalidate library"** action.
 
 **Hashing:** whole-file [blake3](https://github.com/oconnor663/blake3-py)
 (multithreaded, far faster than sha256; the NFS read dominates on large remuxes).
@@ -260,6 +269,11 @@ low-stakes. `hash_algorithm` remains configurable to sha256.
    Synology media shares            scanrr.db (SQLite/WAL)
 ```
 
+**Where I/O happens.** Discovery is **stat-only** (no content reads); *all*
+full-file reads — both blake3 hashing and ffmpeg decoding — run inside the worker
+processes, so they're bounded by `max_scan_workers` (§3). The worker returns
+`(content_hash, status, error_log, duration_ms)`; it takes only the path.
+
 **Single-writer design (#4).** SQLModel is synchronous, so DB calls must never run
 on the asyncio event loop. All **writes** are funnelled through one dedicated
 writer thread fed by an `asyncio.Queue`, preserving a single writer and keeping
@@ -309,10 +323,11 @@ run waiting on a vanished task).
 1. **Trigger** — scheduler (cron) or manual (`POST /api/jobs/:id/run`) creates a
    `job_run` (`queued`), then `running`.
 2. **Discovery** — resolve the source to a file list (walk dir, or query arr +
-   apply path mappings); apply §3 pre-checks. Cheap skips are recorded against the
-   run immediately; cache-miss files are enqueued/subscribed on the shared queue.
+   apply path mappings); apply §3 **stat-only** pre-checks. Stability/TTL skips are
+   recorded against the run immediately; every other file is enqueued/subscribed on
+   the shared queue (the worker later hashes it and does the content-cache check).
 3. **Drain** — the dispatcher pulls the next `pending` task by `seq`, submits it to
-   the pool (bounded in-flight), regardless of which runs it belongs to.
+   the pool (bounded in-flight); the worker hashes → cache-checks → decodes.
 4. **Collect & fan-out** — on completion, write `scan_results`/`files` once,
    `reconcile_detections`, enqueue replacements, and credit **all** subscribed runs.
 5. **Finalize** — a run completes when every file it referenced is terminal
@@ -463,7 +478,8 @@ CREATE TABLE scan_tasks (
                    -- 'pending' also covers retry-backoff waiting (gated by
                    -- next_attempt_at); a transient failure returns the task to
                    -- 'pending' with attempts++ until scan_max_attempts -> 'unreadable'.
-    content_hash   TEXT NOT NULL, -- blake3 computed at discovery; key into scan_results
+    content_hash   TEXT,          -- blake3 computed by the WORKER (Phase B); key into
+                                  -- scan_results. NULL until the task is claimed & hashed.
     result_status  TEXT,          -- ok|corrupt|unreadable (fanned out to subscribers)
     attempts       INTEGER NOT NULL DEFAULT 0,   -- transient failures retried, §3
     next_attempt_at TEXT,         -- backoff gate; NULL = ready now
@@ -491,7 +507,9 @@ CREATE INDEX ix_scan_task_subs_run ON scan_task_subscribers(job_run_id);
 CREATE TABLE run_files (
     job_run_id   INTEGER NOT NULL REFERENCES job_runs(id) ON DELETE CASCADE,
     path         TEXT NOT NULL,
-    disposition  TEXT NOT NULL,  -- queued|skipped_ttl|skipped_hash_cached|skipped_too_fresh
+    disposition  TEXT NOT NULL,  -- queued|skipped_ttl|skipped_too_fresh
+                                 -- (content-cache hits are a WORKER outcome, not a
+                                 --  discovery disposition — see §3; tracked via metrics)
     outcome      TEXT,           -- ok|corrupt|unreadable  (NULL until its task finishes)
     scan_task_id INTEGER REFERENCES scan_tasks(id) ON DELETE SET NULL,
     PRIMARY KEY (job_run_id, path)
@@ -530,6 +548,8 @@ CREATE TABLE detections (
     file_id      INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
     hash         TEXT NOT NULL,
     job_run_id   INTEGER REFERENCES job_runs(id) ON DELETE SET NULL,
+                 -- the run that FIRST surfaced it (informational); a detection is
+                 -- global to the file, not owned by one of a task's subscriber runs
     status       TEXT NOT NULL DEFAULT 'open',
                  -- open|acknowledged|replacing|resolved|ignored|needs_attention
                  -- resolved: a later clean scan of this path cleared it (#6)
@@ -657,7 +677,8 @@ When a corrupt detection has an arr link and the job has `auto_replace`, the run
 **finishes scanning first**, then proposes replacements:
 
 1. **Propose & gate (Q3).** For each corrupt arr-linked file, create a
-   `replacement` in `pending_approval` capturing the intended delete + search. If
+   `replacement` in `pending_approval` capturing the intended delete + search, and
+   enqueue a `replacement_pending_approval` notification (§10). If
    the job has `auto_approve_replacements = 0` (**default**), the run completes and
    the UI shows *"N files will be deleted & re-requested"* for the user to
    **approve or reject** (individually or as a batch). If `auto_approve_replacements
