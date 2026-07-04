@@ -22,10 +22,18 @@
 ## Current state (done)
 
 - [x] SPEC.md v0.3 — reviewed, internally consistent.
-- [x] `backend/scanrr/scanning/integrity.py` — `pyav` + `subprocess` backends,
-      validated equal against corrupted-media fixtures.
-- [x] `backend/tests/` — detection-efficacy regression suite (14 tests).
-- [x] blake3 chosen; `av`, `blake3` in `pyproject.toml`.
+- [x] **M0 foundation** — deps, `ruff` + `mypy` clean, typed `RuntimeConfig`
+      (§13 defaults), WAL engine, JSON decision logging, GitHub Actions CI.
+- [x] **M1 core scan engine** — schema + dedup index, blake3 hashing, worker-side
+      hash→cache→decode, Phase A discovery + synchronous Phase B drain,
+      `reconcile_detections`, CLI (`scanrr scan`), minimal API. 20 tests green
+      (14 detection + 6 idempotency); verified end-to-end via the CLI.
+- [x] All constrained values are enums (`scanrr/enums.py`); no `Any`/type-ignores.
+
+**Deviations from the M0/M1 plan below:** using pip + venv (not `uv`) for now;
+**Alembic deferred to M2** — M1 creates the schema via `SQLModel.metadata.create_all`
++ raw DDL (`db/engine.py`) since the schema is still moving. Baseline migration
+lands once it stabilises.
 
 ---
 

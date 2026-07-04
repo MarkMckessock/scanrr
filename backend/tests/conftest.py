@@ -4,9 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import pytest
-
 import media_fixtures as mf
+import pytest
 
 requires_ffmpeg = pytest.mark.skipif(
     not mf.ffmpeg_available(), reason="ffmpeg CLI not on PATH"

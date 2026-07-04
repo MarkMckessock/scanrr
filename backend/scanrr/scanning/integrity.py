@@ -24,7 +24,9 @@ from __future__ import annotations
 import logging
 import subprocess
 from dataclasses import dataclass
-from enum import Enum
+
+from scanrr.enums import DetectorBackend
+from scanrr.enums import DetectorStatus as Status
 
 # Bumped when detection logic changes in a way that invalidates cached verdicts
 # (SPEC.md sec.3 -- detector_version).
@@ -39,17 +41,11 @@ _ERR_DETECT = "aggressive"
 _MAX_LOG_CHARS = 16_000
 
 
-class Status(str, Enum):
-    OK = "ok"          # decoded cleanly, no errors
-    CORRUPT = "corrupt"  # opened + decoded, but libav reported decode errors
-    ERROR = "error"      # could not open/demux at all (truncated header, not media)
-
-
 @dataclass
 class Outcome:
-    status: Status
+    status: Status  # DetectorStatus: OK | CORRUPT | ERROR
     log: str = ""
-    backend: str = ""
+    backend: DetectorBackend | None = None
     duration_ms: int = 0
     frames_decoded: int = 0
     error_count: int = 0
@@ -120,7 +116,9 @@ def check_pyav(path: str) -> Outcome:
         try:
             container = av.open(path, options={"err_detect": _ERR_DETECT})
         except av.error.FFmpegError as exc:
-            return Outcome(Status.ERROR, log=f"open failed: {exc}", backend="pyav")
+            return Outcome(
+                Status.ERROR, log=f"open failed: {exc}", backend=DetectorBackend.PYAV
+            )
         try:
             for packet in container.demux():
                 try:
@@ -141,7 +139,7 @@ def check_pyav(path: str) -> Outcome:
     return Outcome(
         status=status,
         log=_truncate("\n".join(all_errors)),
-        backend="pyav",
+        backend=DetectorBackend.PYAV,
         frames_decoded=frames,
         error_count=len(all_errors),
     )
@@ -184,21 +182,21 @@ def check_subprocess(path: str, *, timeout: float | None = None) -> Outcome:
     return Outcome(
         status=status,
         log=_truncate(stderr),
-        backend="subprocess",
+        backend=DetectorBackend.SUBPROCESS,
         error_count=len(stderr.splitlines()) if stderr else 0,
     )
 
 
 BACKENDS = {
-    "pyav": check_pyav,
-    "subprocess": check_subprocess,
+    DetectorBackend.PYAV: check_pyav,
+    DetectorBackend.SUBPROCESS: check_subprocess,
 }
 
 
-def check(path: str, backend: str = "pyav") -> Outcome:
+def check(path: str, backend: DetectorBackend = DetectorBackend.PYAV) -> Outcome:
     """Run the configured backend against ``path``."""
     try:
-        fn = BACKENDS[backend]
-    except KeyError:
+        fn = BACKENDS[DetectorBackend(backend)]
+    except (KeyError, ValueError):
         raise ValueError(f"unknown detector backend: {backend!r}") from None
     return fn(path)
