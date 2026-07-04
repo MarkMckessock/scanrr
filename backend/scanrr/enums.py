@@ -90,6 +90,22 @@ class MediaType(StrEnum):
     MOVIE = "movie"
 
 
+class NotificationEvent(StrEnum):
+    SCAN_STARTED = "scan_started"
+    SCAN_COMPLETED = "scan_completed"
+    CORRUPT_FOUND = "corrupt_found"
+    REPLACEMENT_PENDING_APPROVAL = "replacement_pending_approval"
+    REPLACEMENT_REQUESTED = "replacement_requested"
+    REPLACEMENT_COMPLETED = "replacement_completed"
+    JOB_FAILED = "job_failed"
+
+
+class NotificationStatus(StrEnum):
+    PENDING = "pending"
+    SENT = "sent"
+    FAILED = "failed"
+
+
 class ReplacementStatus(StrEnum):
     PENDING_APPROVAL = "pending_approval"
     APPROVED = "approved"

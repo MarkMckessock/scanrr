@@ -53,6 +53,33 @@ class ArrClient:
     async def list_media_files(self) -> list[ArrFile]:  # pragma: no cover - overridden
         raise NotImplementedError
 
+    # --- remediation (SPEC §9) ---------------------------------------------- #
+
+    async def delete_file(self, media_type: MediaType, arr_file_id: int) -> None:
+        endpoint = "episodefile" if media_type is MediaType.EPISODE else "moviefile"
+        resp = await self._client.delete(f"/api/v3/{endpoint}/{arr_file_id}")
+        resp.raise_for_status()
+
+    async def search(self, media_type: MediaType, media_id: int) -> None:
+        if media_type is MediaType.EPISODE:
+            body: dict = {"name": "SeriesSearch", "seriesId": media_id}
+        else:
+            body = {"name": "MoviesSearch", "movieIds": [media_id]}
+        resp = await self._client.post("/api/v3/command", json=body)
+        resp.raise_for_status()
+
+    async def imported(self, media_type: MediaType, media_id: int) -> bool:
+        """True if the arr history shows a recent import for this media (SPEC §9 Q4)."""
+        key = "seriesId" if media_type is MediaType.EPISODE else "movieId"
+        events = {"downloadFolderImported", "movieFileImported", "episodeFileImported"}
+        resp = await self._get(
+            "/api/v3/history", pageSize=50, sortKey="date", sortDirection="descending"
+        )
+        records = resp.json().get("records", [])
+        return any(
+            rec.get("eventType") in events and rec.get(key) == media_id for rec in records
+        )
+
 
 class SonarrClient(ArrClient):
     async def list_media_files(self) -> list[ArrFile]:

@@ -23,6 +23,8 @@ from scanrr.db.models import (
     File,
     FileArrLink,
     JobRun,
+    NotificationLog,
+    NotificationQueue,
     Replacement,
     RunFile,
     ScanResult,
@@ -35,6 +37,8 @@ from scanrr.enums import (
     DetectorStatus,
     Disposition,
     MediaType,
+    NotificationEvent,
+    NotificationStatus,
     ReplacementStatus,
     RunStatus,
     RunTrigger,
@@ -323,6 +327,18 @@ def _finalize_run(session: Session, run: JobRun) -> None:
     run.status = RunStatus.COMPLETED
     run.finished_at = clock.iso_now()
     session.add(run)
+    enqueue_notification(
+        session,
+        NotificationEvent.SCAN_COMPLETED,
+        {
+            "run_id": run.id,
+            "job_name": run.job_name,
+            "files_scanned": run.files_scanned,
+            "files_corrupt": run.files_corrupt,
+            "files_unreadable": run.files_unreadable,
+        },
+        dedup_key=f"run:{run.id}",
+    )
 
 
 def _new_run(spec: JobSpec, trigger: RunTrigger) -> JobRun:
@@ -334,6 +350,7 @@ def _new_run(spec: JobSpec, trigger: RunTrigger) -> JobRun:
         job_config=spec.config,
         ttl_seconds=spec.ttl_seconds,
         auto_replace=spec.auto_replace,
+        auto_approve=spec.auto_approve,
         status=RunStatus.RUNNING,
         trigger=trigger,
         started_at=clock.iso_now(),
@@ -427,8 +444,14 @@ def record_verdict(
     task.result_status = verdict
     session.add(task)
     first_run = next(iter(queue.subscribers(session, task_id)), None)
-    reconcile_detections(session, file, content_hash, verdict, first_run)
+    detection = reconcile_detections(session, file, content_hash, verdict, first_run)
     _fan_out(session, task, verdict)
+    if verdict is Verdict.CORRUPT:
+        enqueue_notification(
+            session, NotificationEvent.CORRUPT_FOUND, {"path": task.path}, dedup_key=task.path
+        )
+        if detection is not None:
+            _propose_replacements(session, task_id, detection)
     return _task_event(session, task_id, task.path, verdict)
 
 
@@ -721,39 +744,157 @@ def stats(session: Session) -> dict:
 # --- Sonarr / Radarr remediation (arr instances are defined in YAML) -------- #
 
 
+# A replacement is "open" (not terminal, not rejected) in these states:
+_OPEN_REPLACEMENT_STATES = (
+    ReplacementStatus.PENDING_APPROVAL,
+    ReplacementStatus.APPROVED,
+    ReplacementStatus.REQUESTED,
+    ReplacementStatus.SEARCHING,
+    ReplacementStatus.GRABBED,
+    ReplacementStatus.IMPORTED,
+    ReplacementStatus.VERIFYING,
+)
+
+
+@dataclass
+class ReplacementJob:
+    """Everything the async executor needs to act on a replacement (SPEC §9)."""
+
+    id: int
+    arr_instance: str
+    media_type: MediaType
+    media_id: int
+    arr_file_id: int
+    detection_id: int
+    file_path: str
+    attempt: int
+    requested_at: str | None
+
+
 def _replacement_dict(r: Replacement) -> dict:
     return {
         "id": r.id,
         "detection_id": r.detection_id,
         "attempt": r.attempt,
         "status": r.status,
+        "arr_instance": r.arr_instance,
         "media_type": r.media_type,
+        "approved_by": r.approved_by,
         "requested_at": r.requested_at,
+        "notes": r.notes,
     }
 
 
-def create_replacement(session: Session, detection_id: int) -> dict | None:
-    """Propose a replacement (SPEC §9). Returns None if the detection is unknown or
-    the file has no arr link (nothing to re-request)."""
-    det = session.get(Detection, detection_id)
-    if det is None:
-        return None
-    link = session.exec(
-        select(FileArrLink).where(FileArrLink.file_id == det.file_id)
+def _open_replacement(session: Session, detection_id: int) -> Replacement | None:
+    return session.exec(
+        select(Replacement)
+        .where(
+            Replacement.detection_id == detection_id,
+            col(Replacement.status).in_(_OPEN_REPLACEMENT_STATES),
+        )
+        .limit(1)
     ).first()
-    if link is None:
-        return None
+
+
+def _new_replacement(
+    session: Session, detection: Detection, link: FileArrLink, *, approved_by: str | None = None
+) -> Replacement:
     repl = Replacement(
-        detection_id=detection_id,
+        detection_id=detection.id,
         arr_instance=link.arr_instance,
         media_type=link.media_type,
         media_id=link.media_id,
         arr_file_id=link.arr_file_id,
-        status=ReplacementStatus.PENDING_APPROVAL,
     )
+    if approved_by is not None:
+        repl.status = ReplacementStatus.APPROVED
+        repl.approved_by = approved_by
+        repl.approved_at = clock.iso_now()
     session.add(repl)
     session.flush()
+    return repl
+
+
+def _propose_replacements(session: Session, task_id: int, detection: Detection) -> None:
+    """On a corrupt scan, propose a replacement for any subscribing auto_replace job."""
+    if detection.id is None:
+        return
+    link = session.exec(select(FileArrLink).where(FileArrLink.file_id == detection.file_id)).first()
+    if link is None or _open_replacement(session, detection.id) is not None:
+        return
+    auto_replace = auto_approve = False
+    for run_id in queue.subscribers(session, task_id):
+        run = session.get(JobRun, run_id)
+        if run is not None and run.auto_replace:
+            auto_replace = True
+            auto_approve = auto_approve or run.auto_approve
+    if not auto_replace:
+        return
+    _new_replacement(session, detection, link, approved_by="auto" if auto_approve else None)
+    event = (
+        NotificationEvent.REPLACEMENT_REQUESTED
+        if auto_approve
+        else NotificationEvent.REPLACEMENT_PENDING_APPROVAL
+    )
+    enqueue_notification(
+        session, event, {"detection_id": detection.id}, dedup_key=f"det:{detection.id}"
+    )
+
+
+def create_replacement(session: Session, detection_id: int) -> dict | None:
+    """Manually propose a replacement (→ pending_approval). None if unknown / no arr link."""
+    det = session.get(Detection, detection_id)
+    if det is None:
+        return None
+    link = session.exec(select(FileArrLink).where(FileArrLink.file_id == det.file_id)).first()
+    if link is None:
+        return None
+    existing = _open_replacement(session, detection_id)
+    if existing is not None:
+        return _replacement_dict(existing)
+    repl = _new_replacement(session, det, link)
+    enqueue_notification(
+        session,
+        NotificationEvent.REPLACEMENT_PENDING_APPROVAL,
+        {"detection_id": detection_id},
+        dedup_key=f"det:{detection_id}",
+    )
     return _replacement_dict(repl)
+
+
+def approve_replacement(session: Session, replacement_id: int, by: str = "user") -> dict | None:
+    r = session.get(Replacement, replacement_id)
+    if r is None:
+        return None
+    if r.status is ReplacementStatus.PENDING_APPROVAL:
+        r.status = ReplacementStatus.APPROVED
+        r.approved_by = by
+        r.approved_at = clock.iso_now()
+        r.updated_at = clock.iso_now()
+        session.add(r)
+    return _replacement_dict(r)
+
+
+def reject_replacement(session: Session, replacement_id: int) -> dict | None:
+    r = session.get(Replacement, replacement_id)
+    if r is None:
+        return None
+    r.status = ReplacementStatus.REJECTED
+    r.updated_at = clock.iso_now()
+    session.add(r)
+    return _replacement_dict(r)
+
+
+def approve_all_pending(session: Session, by: str = "user") -> int:
+    rows = session.exec(
+        select(Replacement).where(Replacement.status == ReplacementStatus.PENDING_APPROVAL)
+    ).all()
+    now = clock.iso_now()
+    for r in rows:
+        r.status = ReplacementStatus.APPROVED
+        r.approved_by, r.approved_at, r.updated_at = by, now, now
+        session.add(r)
+    return len(rows)
 
 
 def list_replacements(session: Session) -> list[dict]:
@@ -761,3 +902,189 @@ def list_replacements(session: Session) -> list[dict]:
     return [_replacement_dict(r) for r in rows]
 
 
+# --- executor DB ops (run on the DB thread; the executor is async, §9) ------ #
+
+
+def _replacement_job(session: Session, r: Replacement) -> ReplacementJob | None:
+    if not (r.id and r.arr_instance and r.media_type and r.media_id and r.arr_file_id):
+        return None
+    det = session.get(Detection, r.detection_id)
+    file = session.get(File, det.file_id) if det is not None else None
+    if file is None:
+        return None
+    return ReplacementJob(
+        id=r.id,
+        arr_instance=r.arr_instance,
+        media_type=r.media_type,
+        media_id=r.media_id,
+        arr_file_id=r.arr_file_id,
+        detection_id=r.detection_id,
+        file_path=file.path,
+        attempt=r.attempt,
+        requested_at=r.requested_at,
+    )
+
+
+def claim_approved(session: Session, limit: int) -> list[ReplacementJob]:
+    rows = session.exec(
+        select(Replacement).where(Replacement.status == ReplacementStatus.APPROVED).limit(limit)
+    ).all()
+    return [job for r in rows if (job := _replacement_job(session, r)) is not None]
+
+
+def in_flight_replacements(session: Session) -> list[ReplacementJob]:
+    rows = session.exec(
+        select(Replacement).where(Replacement.status == ReplacementStatus.REQUESTED)
+    ).all()
+    return [job for r in rows if (job := _replacement_job(session, r)) is not None]
+
+
+def mark_requested(session: Session, replacement_id: int) -> None:
+    r = session.get(Replacement, replacement_id)
+    if r is None:
+        return
+    r.status = ReplacementStatus.REQUESTED
+    r.requested_at = r.requested_at or clock.iso_now()
+    r.updated_at = clock.iso_now()
+    session.add(r)
+    enqueue_notification(
+        session,
+        NotificationEvent.REPLACEMENT_REQUESTED,
+        {"replacement_id": replacement_id},
+        dedup_key=f"repl:{replacement_id}:req:{r.attempt}",
+    )
+
+
+def replacement_failed(session: Session, replacement_id: int, note: str) -> None:
+    r = session.get(Replacement, replacement_id)
+    if r is None:
+        return
+    r.status = ReplacementStatus.FAILED
+    r.notes, r.updated_at = note, clock.iso_now()
+    session.add(r)
+    det = session.get(Detection, r.detection_id)
+    if det is not None:
+        det.status = DetectionStatus.NEEDS_ATTENTION
+        session.add(det)
+
+
+def replacement_verified(
+    session: Session, replacement_id: int, verdict: Verdict, max_attempts: int
+) -> None:
+    """Apply the verify re-scan outcome: succeed / retry / exhaust (SPEC §9 #6)."""
+    r = session.get(Replacement, replacement_id)
+    if r is None:
+        return
+    det = session.get(Detection, r.detection_id)
+    if verdict is Verdict.OK:
+        r.status = ReplacementStatus.SUCCEEDED
+        if det is not None:
+            det.status = DetectionStatus.RESOLVED
+            det.resolved_at = clock.iso_now()
+            session.add(det)
+        enqueue_notification(
+            session,
+            NotificationEvent.REPLACEMENT_COMPLETED,
+            {"detection_id": r.detection_id},
+            dedup_key=f"repl:{replacement_id}:done",
+        )
+    elif r.attempt < max_attempts:
+        r.attempt += 1
+        r.status = ReplacementStatus.APPROVED  # re-execute delete+search
+        r.requested_at = None
+    else:
+        r.status = ReplacementStatus.EXHAUSTED
+        if det is not None:
+            det.status = DetectionStatus.NEEDS_ATTENTION
+            session.add(det)
+    r.updated_at = clock.iso_now()
+    session.add(r)
+
+
+
+
+# --- Notifications (SPEC §10) ------------------------------------------------ #
+
+
+@dataclass
+class PendingNotification:
+    id: int
+    payload: str  # JSON
+
+
+def enqueue_notification(
+    session: Session,
+    event: NotificationEvent,
+    payload: dict,
+    *,
+    dedup_key: str | None = None,
+) -> None:
+    """Queue an event for the periodic flusher (§10). dedup_key collapses repeats."""
+    if dedup_key is not None:
+        existing = session.exec(
+            select(NotificationQueue).where(
+                NotificationQueue.event_type == event,
+                NotificationQueue.dedup_key == dedup_key,
+                NotificationQueue.status == NotificationStatus.PENDING,
+            ).limit(1)
+        ).first()
+        if existing is not None:
+            return
+    session.add(
+        NotificationQueue(event_type=event, dedup_key=dedup_key, payload=json.dumps(payload))
+    )
+
+
+def pending_notifications(session: Session) -> dict[NotificationEvent, list[PendingNotification]]:
+    rows = session.exec(
+        select(NotificationQueue)
+        .where(NotificationQueue.status == NotificationStatus.PENDING)
+        .order_by(col(NotificationQueue.created_at))
+    ).all()
+    groups: dict[NotificationEvent, list[PendingNotification]] = {}
+    for r in rows:
+        assert r.id is not None
+        groups.setdefault(r.event_type, []).append(PendingNotification(id=r.id, payload=r.payload))
+    return groups
+
+
+def mark_notifications(session: Session, ids: list[int], status: NotificationStatus) -> None:
+    now = clock.iso_now()
+    for nid in ids:
+        n = session.get(NotificationQueue, nid)
+        if n is not None:
+            n.status = status
+            n.sent_at = now if status is NotificationStatus.SENT else None
+            session.add(n)
+
+
+def log_notification(
+    session: Session,
+    event: NotificationEvent,
+    title: str,
+    batched: int,
+    status: NotificationStatus,
+    error: str | None = None,
+) -> None:
+    session.add(
+        NotificationLog(
+            event_type=event, title=title, batched=batched, status=status, error=error
+        )
+    )
+
+
+def list_notifications(session: Session, limit: int = 50) -> list[dict]:
+    rows = session.exec(
+        select(NotificationLog).order_by(col(NotificationLog.id).desc()).limit(limit)
+    ).all()
+    return [
+        {
+            "id": r.id,
+            "event_type": r.event_type,
+            "title": r.title,
+            "batched": r.batched,
+            "status": r.status,
+            "created_at": r.created_at,
+        }
+        for r in rows
+    ]

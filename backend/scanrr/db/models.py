@@ -18,6 +18,8 @@ from scanrr.enums import (
     Disposition,
     JobType,
     MediaType,
+    NotificationEvent,
+    NotificationStatus,
     ReplacementStatus,
     RunStatus,
     RunTrigger,
@@ -46,6 +48,7 @@ class JobRun(SQLModel, table=True):
     job_config: str = "{}"  # JSON snapshot: {"root_path": ...} | {"arr_instance_id": ...}
     ttl_seconds: int = 0
     auto_replace: bool = False
+    auto_approve: bool = False
     status: RunStatus = Field(default=RunStatus.QUEUED, sa_column=enum_col(RunStatus))
     trigger: RunTrigger = Field(default=RunTrigger.MANUAL, sa_column=enum_col(RunTrigger))
     started_at: str | None = None
@@ -164,3 +167,30 @@ class Replacement(SQLModel, table=True):
     requested_at: str | None = None
     updated_at: str = Field(default_factory=clock.iso_now)
     notes: str | None = None
+
+
+# --- Notifications (SPEC §10) — Pushover config is in the YAML (§0) ---------- #
+
+
+class NotificationQueue(SQLModel, table=True):
+    __tablename__ = "notification_queue"
+    id: int | None = Field(default=None, primary_key=True)
+    event_type: NotificationEvent = Field(sa_column=enum_col(NotificationEvent))
+    dedup_key: str | None = None          # collapse duplicates before flush
+    payload: str = "{}"                   # JSON event detail
+    status: NotificationStatus = Field(
+        default=NotificationStatus.PENDING, sa_column=enum_col(NotificationStatus)
+    )
+    created_at: str = Field(default_factory=clock.iso_now, index=True)
+    sent_at: str | None = None
+
+
+class NotificationLog(SQLModel, table=True):
+    __tablename__ = "notification_log"
+    id: int | None = Field(default=None, primary_key=True)
+    event_type: NotificationEvent = Field(sa_column=enum_col(NotificationEvent))
+    title: str = ""
+    batched: int = 0                      # count of events covered by this send
+    status: NotificationStatus = Field(sa_column=enum_col(NotificationStatus))
+    error: str | None = None
+    created_at: str = Field(default_factory=clock.iso_now)

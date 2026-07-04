@@ -4,6 +4,7 @@ import Dashboard from "./pages/Dashboard";
 import Jobs from "./pages/Jobs";
 import RunDetail from "./pages/RunDetail";
 import Detections from "./pages/Detections";
+import Replacements from "./pages/Replacements";
 import Integrations from "./pages/Integrations";
 import Settings from "./pages/Settings";
 
@@ -11,6 +12,7 @@ const NAV = [
   { to: "/", label: "Dashboard", end: true },
   { to: "/jobs", label: "Jobs", end: false },
   { to: "/detections", label: "Corrupt files", end: false },
+  { to: "/replacements", label: "Replacements", end: false },
   { to: "/integrations", label: "Integrations", end: false },
   { to: "/settings", label: "Settings", end: false },
 ];
@@ -46,6 +48,7 @@ export default function App() {
           <Route path="/jobs" element={<Jobs />} />
           <Route path="/runs/:id" element={<RunDetail />} />
           <Route path="/detections" element={<Detections />} />
+          <Route path="/replacements" element={<Replacements />} />
           <Route path="/integrations" element={<Integrations />} />
           <Route path="/settings" element={<Settings />} />
         </Routes>

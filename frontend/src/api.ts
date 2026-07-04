@@ -74,8 +74,20 @@ export interface Replacement {
   detection_id: number;
   attempt: number;
   status: string;
+  arr_instance: string | null;
   media_type: string | null;
+  approved_by: string | null;
   requested_at: string | null;
+  notes: string | null;
+}
+
+export interface NotificationEntry {
+  id: number;
+  event_type: string;
+  title: string;
+  batched: number;
+  status: string;
+  created_at: string;
 }
 
 const BASE = "/api";
@@ -109,4 +121,8 @@ export const api = {
   testArrInstance: (name: string) =>
     post<{ ok: boolean; version?: string }>(`/arr-instances/${name}/test`),
   replacements: () => req<Replacement[]>("/replacements"),
+  approveReplacement: (id: number) => post<Replacement>(`/replacements/${id}/approve`),
+  rejectReplacement: (id: number) => post<Replacement>(`/replacements/${id}/reject`),
+  approveAllReplacements: () => post<{ approved: number }>("/replacements/approve"),
+  notifications: () => req<NotificationEntry[]>("/notifications"),
 };

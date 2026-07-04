@@ -16,7 +16,7 @@ from dataclasses import dataclass
 import yaml
 
 from scanrr.core.config import RuntimeConfig
-from scanrr.enums import ArrType, JobType
+from scanrr.enums import ArrType, JobType, NotificationEvent
 
 
 @dataclass(frozen=True)
@@ -31,6 +31,7 @@ class JobSpec:
     schedule_cron: str | None
     enabled: bool
     auto_replace: bool
+    auto_approve: bool = False  # bypass the human approval gate (SPEC §9)
 
 
 @dataclass(frozen=True)
@@ -84,7 +85,23 @@ def _job_spec_from_yaml(entry: dict) -> JobSpec:
         schedule_cron=entry.get("schedule_cron"),
         enabled=bool(entry.get("enabled", True)),
         auto_replace=bool(entry.get("auto_replace", False)),
+        auto_approve=bool(entry.get("auto_approve", False)),
     )
+
+
+@dataclass(frozen=True)
+class PushoverConfig:
+    user_key: str
+    api_token: str
+    events: frozenset[NotificationEvent]  # which events to send; empty = all
+
+
+def _pushover_from_yaml(data: dict) -> PushoverConfig | None:
+    p = data.get("pushover")
+    if not p:
+        return None
+    events = frozenset(NotificationEvent(e) for e in (p.get("events") or []))
+    return PushoverConfig(user_key=p["user_key"], api_token=p["api_token"], events=events)
 
 
 @dataclass(frozen=True)
@@ -92,12 +109,13 @@ class FileConfig:
     config: RuntimeConfig
     jobs: list[JobSpec]
     arr_instances: list[ArrInstanceSpec]
+    pushover: PushoverConfig | None
 
 
 def load_file_config(path: str, base: RuntimeConfig) -> FileConfig:
     """Parse the YAML config. A missing/empty file yields base config, no jobs/instances."""
     if not path or not os.path.exists(path):
-        return FileConfig(config=base, jobs=[], arr_instances=[])
+        return FileConfig(config=base, jobs=[], arr_instances=[], pushover=None)
 
     with open(path) as fh:
         data = yaml.safe_load(fh) or {}
@@ -115,4 +133,9 @@ def load_file_config(path: str, base: RuntimeConfig) -> FileConfig:
     if len(set(names)) != len(names):
         raise ValueError("duplicate arr instance name in YAML config (must be globally unique)")
 
-    return FileConfig(config=effective, jobs=jobs, arr_instances=arr_instances)
+    return FileConfig(
+        config=effective,
+        jobs=jobs,
+        arr_instances=arr_instances,
+        pushover=_pushover_from_yaml(data),
+    )

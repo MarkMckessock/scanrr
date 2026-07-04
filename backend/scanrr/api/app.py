@@ -28,7 +28,9 @@ from scanrr.integrations.arr import make_client
 from scanrr.jobs.scheduler import Scheduler
 from scanrr.scanning import engine
 from scanrr.scanning.executor import PebbleExecutor
+from scanrr.scanning.notifier import NotificationFlusher
 from scanrr.scanning.orchestrator import Orchestrator
+from scanrr.scanning.replacer import ReplacementExecutor
 
 FRONTEND_DIST = Path(__file__).resolve().parents[3] / "frontend" / "dist"
 
@@ -60,6 +62,10 @@ async def lifespan(app: FastAPI):
     await orchestrator.start()
     scheduler = Scheduler(orchestrator, db, fc.config, yaml_jobs=fc.jobs)
     await scheduler.start()
+    flusher = NotificationFlusher(db, fc.config, fc.pushover)
+    await flusher.start()
+    replacer = ReplacementExecutor(db, fc.config, arr_registry, orchestrator.executor)
+    await replacer.start()
     app.state.db, app.state.bus = db, bus
     app.state.orchestrator, app.state.scheduler = orchestrator, scheduler
     app.state.config, app.state.yaml_specs = fc.config, fc.jobs
@@ -68,6 +74,8 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         scheduler.stop()
+        await flusher.stop()
+        await replacer.stop()
         await orchestrator.stop()
         db.close()
 
@@ -218,6 +226,33 @@ async def test_arr_instance(name: str, request: Request) -> dict:
 @app.get("/api/replacements")
 async def list_replacements(request: Request) -> list[dict]:
     return await _db(request).run(engine.list_replacements)
+
+
+@app.post("/api/replacements/approve", dependencies=[Depends(require_token)])
+async def approve_all_replacements(request: Request) -> dict:
+    n = await _db(request).run(lambda s: engine.approve_all_pending(s))
+    return {"approved": n}
+
+
+@app.post("/api/replacements/{replacement_id}/approve", dependencies=[Depends(require_token)])
+async def approve_replacement(replacement_id: int, request: Request) -> dict:
+    result = await _db(request).run(lambda s: engine.approve_replacement(s, replacement_id))
+    if result is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "replacement not found")
+    return result
+
+
+@app.post("/api/replacements/{replacement_id}/reject", dependencies=[Depends(require_token)])
+async def reject_replacement(replacement_id: int, request: Request) -> dict:
+    result = await _db(request).run(lambda s: engine.reject_replacement(s, replacement_id))
+    if result is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "replacement not found")
+    return result
+
+
+@app.get("/api/notifications")
+async def list_notifications(request: Request) -> list[dict]:
+    return await _db(request).run(engine.list_notifications)
 
 
 # --- realtime --------------------------------------------------------------- #

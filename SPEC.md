@@ -51,6 +51,11 @@ sonarr:                        # zero or more Sonarr instances (same shape)
     api_key: <key>
     mappings: [{ from: /data/media/tv, to: /mnt/tv }]
 
+pushover:                      # optional notifications (§10)
+  user_key: <key>
+  api_token: <key>
+  events: [corrupt_found, scan_completed, replacement_completed]  # omit = all
+
 jobs:
   - name: Movies               # slug = slugify(name), unique; used in routes/runs
     type: path
@@ -61,6 +66,8 @@ jobs:
     type: arr
     arr_instance: tv           # reference an instance by name
     ttl_days: 14
+    auto_replace: true         # re-request corrupt files (§9)
+    auto_approve: false        # keep the human approval gate (default)
 ```
 
 - **Jobs** are held in an in-memory registry keyed by `slug` (a deterministic slug
@@ -510,6 +517,7 @@ CREATE TABLE job_runs (
     job_config         TEXT NOT NULL DEFAULT '{}',  -- JSON: {root_path}|{arr_instance}
     ttl_seconds        INTEGER NOT NULL DEFAULT 0,
     auto_replace       INTEGER NOT NULL DEFAULT 0,
+    auto_approve       INTEGER NOT NULL DEFAULT 0,   -- bypass the human gate (§9)
     status             TEXT NOT NULL           -- queued|running|completed|failed|
                        DEFAULT 'queued',       --   cancelling|cancelled|interrupted
     trigger            TEXT NOT NULL,           -- manual | scheduled
@@ -660,21 +668,9 @@ CREATE TABLE replacements (
 CREATE INDEX ix_replacements_detection ON replacements(detection_id);
 CREATE INDEX ix_replacements_status ON replacements(status);  -- pending_approval queue
 
--- Notification config + audit
-CREATE TABLE notification_channels (
-    id       INTEGER PRIMARY KEY,
-    type     TEXT NOT NULL DEFAULT 'pushover',
-    config   TEXT NOT NULL,                   -- JSON {user_key, api_token, priority}
-    enabled  INTEGER NOT NULL DEFAULT 1
-);
-CREATE TABLE notification_rules (
-    channel_id INTEGER NOT NULL REFERENCES notification_channels(id) ON DELETE CASCADE,
-    event_type TEXT NOT NULL,     -- scan_started|scan_completed|corrupt_found|
-                                  --   replacement_pending_approval|replacement_requested|
-                                  --   replacement_completed|job_failed  (canonical list: §10)
-    enabled    INTEGER NOT NULL DEFAULT 1,
-    PRIMARY KEY (channel_id, event_type)
-);
+-- (No notification_channels/rules tables — Pushover config + the enabled event
+--  set live in the YAML `pushover:` stanza (§0, §10).)
+
 -- Outbound notification QUEUE (Q5). Events enqueue here instead of sending
 -- inline; a periodic flusher drains it (individual vs batched by threshold, §10).
 CREATE TABLE notification_queue (
@@ -691,9 +687,8 @@ CREATE INDEX ix_notification_queue_pending ON notification_queue(status, event_t
 CREATE TABLE notification_log (
     id          INTEGER PRIMARY KEY,
     event_type  TEXT NOT NULL,
-    channel_id  INTEGER REFERENCES notification_channels(id) ON DELETE SET NULL,
-    payload     TEXT,
-    batched     INTEGER NOT NULL DEFAULT 0,  -- 1 = this send covered multiple events
+    title       TEXT NOT NULL DEFAULT '',
+    batched     INTEGER NOT NULL DEFAULT 0,  -- count of events covered by this send
     status      TEXT NOT NULL,               -- sent | failed
     error       TEXT,
     created_at  TEXT NOT NULL
@@ -745,16 +740,25 @@ When a corrupt detection has an arr link and the job has `auto_replace`, the run
    timeout with no grab → `failed`, detection `needs_attention`, notify
    ("no release found"). Self-contained — needs no arr-side webhook config.
    (Webhook-driven confirmation is a possible future optimisation.)
-5. **Verify (#6):** on import, enqueue a **targeted re-scan of the new file**.
+5. **Verify (#6):** on import, **re-scan the file at its path** (decode it directly).
    - clean → `succeeded`, resolve the detection, fire `replacement_completed`.
    - still corrupt → if `attempt < max_replace_attempts` (default 2) start the next
-     attempt at step 2; otherwise `exhausted`, detection `needs_attention`, notify.
+     attempt at step 2; otherwise `exhausted`, detection `needs_attention`.
      Closes the loop; prevents an endless delete → grab-bad-release → delete cycle.
 
-**Safety:** `auto_replace` defaults **off**. Approval is required by default and
-must be explicitly disabled per job. Deletions are irreversible, so the UI shows a
-clear warning, the per-run cap bounds blast radius, and every action is audited in
-`replacements`.
+**Safety:** `auto_replace` defaults **off** (a YAML job option). Approval is required
+by default; `auto_approve: true` is an explicit per-job opt-out. Deletions are
+irreversible, so the UI shows a clear warning, the deletion cap bounds blast radius,
+and every action is audited in `replacements`.
+
+**Implementation (M5).** A periodic `ReplacementExecutor` (interval
+`replacement_poll_interval`) reconciles: it executes **approved** replacements
+(delete + search → `requested`, at most `max_deletions_per_run` per tick), then
+polls **requested** ones via the arr history (`imported()`), verifying on import and
+timing out at `replacement_search_timeout`. Arr calls (`delete_file`, `search`,
+`imported`) are async httpx against the YAML instance; DB writes go through the DB
+thread. Manual `POST /detections/:id/replace` proposes a `pending_approval` row;
+approval flips it to `approved` for the executor to pick up.
 
 ---
 
@@ -764,22 +768,23 @@ Events: `scan_started`, `scan_completed` (with summary counts),
 `corrupt_found`, `replacement_pending_approval`, `replacement_requested`,
 `replacement_completed`, `job_failed`.
 
-**Queue + periodic flush (Q5).** Events do **not** send inline. Producers enqueue
-into `notification_queue`; a scheduled **flusher** runs every
-`notification_flush_interval` (default 300s) and drains pending events:
-- grouped per channel + `event_type`, duplicates collapsed by `dedup_key`;
-- if a group has **fewer than `notification_batch_threshold`** (default 5) events →
-  send them **individually** (timely per-file alerts in steady state);
-- otherwise send **one batched digest** ("47 corrupt files found — see scanrr"),
-  avoiding a push-storm on a big first scan and Pushover rate limits.
+**Config in the YAML (§0).** The `pushover:` stanza holds `user_key`, `api_token`,
+and an optional `events:` allow-list (omit = all). No `notification_channels`/`rules`
+tables — like arr, notifications are configuration, not DB data. No `pushover:`
+stanza → notifications are disabled (the queue still drains, sending nothing).
 
-This decouples detection from delivery: sends never block scanning, transient
-Pushover failures retry on the next flush, and `notification_log` records each send
-(with `batched`).
+**Queue + periodic flush (Q5).** Events do **not** send inline. Producers
+`enqueue_notification` into `notification_queue` (dedup by `dedup_key`); the
+`NotificationFlusher` runs every `notification_flush_interval` (default 300s) and
+drains, grouped by `event_type`:
+- fewer than `notification_batch_threshold` (default 5) → send **individually**;
+- otherwise **one batched digest** ("47 corrupt files found") — no push-storm on a
+  big first scan, respecting Pushover rate limits.
 
-- Per-channel, per-event toggles (`notification_rules`); the flusher honours them.
-- Provider abstracted behind a `NotificationChannel` interface so more backends
-  (ntfy, Discord, …) can be added later without schema churn.
+Sends never block scanning; transient failures are recorded in `notification_log`
+(status `failed`) and don't stall the queue. Events not in the `events:` allow-list
+are drained without sending. The Pushover client is behind a thin interface so more
+backends (ntfy, Discord, …) can be added later.
 
 ---
 
@@ -799,13 +804,11 @@ Base: `/api`. JSON throughout.
 | POST | `/detections/:id/acknowledge` · `/ignore` · `/resolve` | Triage transitions |
 | GET | `/replacements` | List replacements (filter by status, e.g. `pending_approval`) |
 | POST | `/replacements/:id/approve` · `/reject` | Approve/reject a proposed deletion (Q3) |
-| POST | `/replacements/approve` | Bulk-approve a batch (body: ids or run id) |
-| GET | `/files` | Search scanned files (path/hash/status) |
+| POST | `/replacements/approve` | Bulk-approve all `pending_approval` |
 | GET | `/arr-instances` | List arr instances (from YAML — **read-only**, no api_key) |
 | POST | `/arr-instances/:name/test` | Connection test (by name) |
 | GET | `/settings` | Effective runtime config (DEFAULTS + YAML `settings:`) |
-| GET/PUT | `/notifications` | Channels + rules (M5) |
-| POST | `/notifications/test` | Send a test push (M5) |
+| GET | `/notifications` | Notification send log (`notification_log`) |
 | POST | `/library/revalidate` | Re-scan against current detector (scope-previewed, rate-limited) (#7) |
 | GET | `/stats` | Dashboard aggregates |
 | GET | `/events` | **SSE** stream: run progress, task updates, new detections |

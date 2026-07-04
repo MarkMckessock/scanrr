@@ -58,6 +58,18 @@
       `POST /detections/:id/replace` (→ pending_approval); Integrations UI page.
       34 backend tests (path mapping, mocked arr clients, encryption round-trip,
       full arr-job discovery+link+replace); Integrations page validated visually.
+      (Superseded by the YAML refactor: arr instances moved to the config file.)
+
+- [x] **M5 auto-replace + notifications** — Pushover config in the YAML
+      (`pushover:` stanza; no DB channels/rules tables); `notification_queue` +
+      `notification_log`; `NotificationFlusher` (periodic; individual under
+      `notification_batch_threshold`, else batched digest) + async Pushover client.
+      Replacement execution: auto-propose on corrupt for `auto_replace` jobs, manual
+      `POST /detections/:id/replace`, approve/reject/bulk API, and a periodic
+      `ReplacementExecutor` (delete → search → poll arr history → verify re-scan →
+      resolve/retry/exhaust) with a per-tick deletion cap; arr client gained
+      delete/search/imported. UI Replacements page. 52 backend tests (notification
+      batching + drain; full executor loop incl. retry→exhaust + auto-propose-on-scan).
 
 **Deviations / deferrals:** pip + venv (not `uv`); **Alembic still deferred**
 (schema via `create_all` + raw DDL). UI uses hand-written Tailwind components
