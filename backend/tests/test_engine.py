@@ -7,16 +7,15 @@ rules and remediation behaviour, not just that ffmpeg detects corruption
 
 from __future__ import annotations
 
-import json
 import shutil
-from pathlib import Path
 
 import pytest
+from specs import path_spec
 from sqlmodel import Session, select
 
 from scanrr.db import engine as db_engine
-from scanrr.db.models import Detection, Job, RunFile, ScanResult
-from scanrr.enums import DetectionStatus, JobType, Verdict
+from scanrr.db.models import Detection, RunFile, ScanResult
+from scanrr.enums import DetectionStatus, Verdict
 from scanrr.scanning import engine as scan_engine
 from scanrr.scanning import worker
 from scanrr.scanning.engine import RuntimeConfig, run_job
@@ -47,15 +46,8 @@ def decode_counter(monkeypatch) -> list[int]:
     return calls
 
 
-def make_job(session: Session, root: Path, *, ttl_seconds: int = 30 * 86_400) -> Job:
-    job = Job(
-        name="t", type=JobType.PATH, ttl_seconds=ttl_seconds,
-        config=json.dumps({"root_path": str(root)}),
-    )
-    session.add(job)
-    session.commit()
-    session.refresh(job)
-    return job
+def make_job(session: Session, root, *, ttl_seconds: int = 30 * 86_400):
+    return path_spec(root, ttl_seconds=ttl_seconds)
 
 
 def test_detects_corruption_and_is_idempotent(session, media, tmp_path):

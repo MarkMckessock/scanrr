@@ -16,13 +16,13 @@ from sqlmodel import Session, col, select
 
 from scanrr.core import clock, crypto
 from scanrr.core.config import RuntimeConfig
+from scanrr.core.fileconfig import JobSpec
 from scanrr.core.logging import decision
 from scanrr.db.models import (
     ArrInstance,
     Detection,
     File,
     FileArrLink,
-    Job,
     JobRun,
     PathMapping,
     Replacement,
@@ -37,7 +37,6 @@ from scanrr.enums import (
     DetectorBackend,
     DetectorStatus,
     Disposition,
-    JobType,
     MediaType,
     ReplacementStatus,
     RunStatus,
@@ -239,7 +238,7 @@ def _consider(
 
 def discover(
     session: Session,
-    job: Job,
+    spec: JobSpec,
     run: JobRun,
     config: RuntimeConfig,
     arr_candidates: list[ArrCandidate] | None = None,
@@ -254,12 +253,12 @@ def discover(
     discovered = 0
     if arr_candidates is None:
         for path, st in walk_media(
-            json.loads(job.config)["root_path"],
+            json.loads(spec.config)["root_path"],
             config.media_extensions,
             config.min_file_size_bytes,
         ):
             discovered += 1
-            _consider(session, run.id, job.ttl_seconds, path, st, config, None)
+            _consider(session, run.id, spec.ttl_seconds, path, st, config, None)
     else:
         for cand in arr_candidates:
             try:
@@ -267,7 +266,7 @@ def discover(
             except OSError:
                 continue  # vanished between enumeration and now
             discovered += 1
-            _consider(session, run.id, job.ttl_seconds, cand.local_path, st, config, cand)
+            _consider(session, run.id, spec.ttl_seconds, cand.local_path, st, config, cand)
     run.files_discovered = discovered
     session.add(run)
     session.flush()
@@ -329,25 +328,35 @@ def _finalize_run(session: Session, run: JobRun) -> None:
     session.add(run)
 
 
+def _new_run(spec: JobSpec, trigger: RunTrigger) -> JobRun:
+    """A run row snapshotting its job's definition (SPEC §9 — self-contained runs)."""
+    return JobRun(
+        job_slug=spec.slug,
+        job_name=spec.name,
+        job_type=spec.type,
+        job_config=spec.config,
+        ttl_seconds=spec.ttl_seconds,
+        auto_replace=spec.auto_replace,
+        status=RunStatus.RUNNING,
+        trigger=trigger,
+        started_at=clock.iso_now(),
+    )
+
+
 def run_job(
     session: Session,
-    job: Job,
+    spec: JobSpec,
     *,
     config: RuntimeConfig | None = None,
     trigger: RunTrigger = RunTrigger.MANUAL,
 ) -> JobRun:
     """Execute a job end-to-end (M1 synchronous). Returns the finalized run."""
     config = config or RuntimeConfig()
-    run = JobRun(
-        job_id=job.id,
-        status=RunStatus.RUNNING,
-        trigger=trigger,
-        started_at=clock.iso_now(),
-    )
+    run = _new_run(spec, trigger)
     session.add(run)
     session.flush()
 
-    discover(session, job, run, config)
+    discover(session, spec, run, config)
     while (task := queue.claim_next_pending(session)) is not None:
         process_task(session, task, config)
     _finalize_run(session, run)
@@ -372,21 +381,17 @@ def recover_interrupted(session: Session) -> int:
 
 def start_run(
     session: Session,
-    job_id: int,
+    spec: JobSpec,
     trigger: RunTrigger,
     config: RuntimeConfig,
     arr_candidates: list[ArrCandidate] | None = None,
 ) -> int:
     """Create a run and run Phase A discovery (enqueue). Returns the run id."""
-    job = session.get(Job, job_id)
-    assert job is not None and job.id is not None
-    run = JobRun(
-        job_id=job.id, status=RunStatus.RUNNING, trigger=trigger, started_at=clock.iso_now()
-    )
+    run = _new_run(spec, trigger)
     session.add(run)
     session.flush()
     assert run.id is not None
-    discover(session, job, run, config, arr_candidates)
+    discover(session, spec, run, config, arr_candidates)
     finalize_run_if_done(session, run.id)  # all-skipped runs finalize immediately
     return run.id
 
@@ -573,11 +578,11 @@ def get_run_status(session: Session, run_id: int) -> RunStatus | None:
     return run.status if run is not None else None
 
 
-def job_has_active_run(session: Session, job_id: int) -> bool:
+def job_has_active_run(session: Session, job_slug: str) -> bool:
     row = session.exec(
         select(JobRun)
         .where(
-            JobRun.job_id == job_id,
+            JobRun.job_slug == job_slug,
             col(JobRun.status).in_((RunStatus.RUNNING, RunStatus.CANCELLING)),
         )
         .limit(1)
@@ -585,81 +590,43 @@ def job_has_active_run(session: Session, job_id: int) -> bool:
     return row is not None
 
 
-def scheduled_jobs(session: Session) -> list[tuple[int, str]]:
-    """(job_id, cron) for enabled jobs that have a schedule."""
-    rows = session.exec(
-        select(Job).where(col(Job.enabled).is_(True), col(Job.schedule_cron).is_not(None))
-    )
-    return [(j.id, j.schedule_cron) for j in rows if j.id is not None and j.schedule_cron]
+# --- read helpers for the API ----------------------------------------------- #
 
 
-# --- read/triage helpers for the API (M3) ----------------------------------- #
-
-
-def _job_dict(session: Session, job: Job) -> dict:
+def _job_dict(session: Session, spec: JobSpec) -> dict:
+    """Render a (read-only, YAML-defined) job with its most recent run."""
     last = session.exec(
-        select(JobRun).where(JobRun.job_id == job.id).order_by(col(JobRun.id).desc()).limit(1)
+        select(JobRun)
+        .where(JobRun.job_slug == spec.slug)
+        .order_by(col(JobRun.id).desc())
+        .limit(1)
     ).first()
+    config = json.loads(spec.config)
     return {
-        "id": job.id,
-        "name": job.name,
-        "type": job.type,
-        "enabled": job.enabled,
-        "ttl_seconds": job.ttl_seconds,
-        "schedule_cron": job.schedule_cron,
-        "root_path": json.loads(job.config).get("root_path"),
-        "auto_replace": job.auto_replace,
+        "slug": spec.slug,
+        "name": spec.name,
+        "type": spec.type,
+        "enabled": spec.enabled,
+        "ttl_seconds": spec.ttl_seconds,
+        "schedule_cron": spec.schedule_cron,
+        "root_path": config.get("root_path"),
+        "arr_instance_id": config.get("arr_instance_id"),
+        "auto_replace": spec.auto_replace,
         "last_run": None
         if last is None
         else {"id": last.id, "status": last.status, "finished_at": last.finished_at},
     }
 
 
-def list_jobs(session: Session) -> list[dict]:
-    jobs = session.exec(select(Job).order_by(col(Job.id))).all()
-    return [_job_dict(session, j) for j in jobs]
-
-
-def create_job(
-    session: Session, *, name: str, root_path: str, ttl_seconds: int, schedule_cron: str | None
-) -> dict:
-    job = Job(
-        name=name,
-        type=JobType.PATH,
-        ttl_seconds=ttl_seconds,
-        schedule_cron=schedule_cron,
-        config=json.dumps({"root_path": root_path}),
-    )
-    session.add(job)
-    session.flush()
-    return _job_dict(session, job)
-
-
-def update_job(session: Session, job_id: int, fields: dict) -> dict | None:
-    job = session.get(Job, job_id)
-    if job is None:
-        return None
-    for key in ("name", "enabled", "ttl_seconds", "schedule_cron", "auto_replace"):
-        if key in fields and fields[key] is not None:
-            setattr(job, key, fields[key])
-    job.updated_at = clock.iso_now()
-    session.add(job)
-    session.flush()
-    return _job_dict(session, job)
-
-
-def delete_job(session: Session, job_id: int) -> bool:
-    job = session.get(Job, job_id)
-    if job is None:
-        return False
-    session.delete(job)
-    return True
+def list_jobs(session: Session, yaml_specs: list[JobSpec]) -> list[dict]:
+    return [_job_dict(session, spec) for spec in yaml_specs]
 
 
 def _run_dict(run: JobRun) -> dict:
     return {
         "id": run.id,
-        "job_id": run.job_id,
+        "job_slug": run.job_slug,
+        "job_name": run.job_name,
         "status": run.status,
         "trigger": run.trigger,
         "files_discovered": run.files_discovered,
@@ -744,9 +711,8 @@ def stats(session: Session) -> dict:
             )
         ).all()
     )
-    jobs = len(session.exec(select(Job)).all())
+    # "jobs" count is added by the API from the YAML registry (no jobs table).
     return {
-        "jobs": jobs,
         "active_runs": active_runs,
         "open_detections": open_detections,
         "files_ok": ok,
@@ -759,23 +725,11 @@ def stats(session: Session) -> dict:
 
 
 @dataclass
-class JobInfo:
-    id: int
-    type: JobType
-    config: str
-
-
-@dataclass
 class ArrInstanceInfo:
     id: int
     type: ArrType
     base_url: str
     api_key: str  # decrypted — for use, never returned to the API
-
-
-def job_info(session: Session, job_id: int) -> JobInfo | None:
-    job = session.get(Job, job_id)
-    return JobInfo(id=job.id, type=job.type, config=job.config) if job and job.id else None
 
 
 def get_arr_instance_info(session: Session, instance_id: int) -> ArrInstanceInfo | None:
@@ -900,21 +854,3 @@ def list_replacements(session: Session) -> list[dict]:
     return [_replacement_dict(r) for r in rows]
 
 
-def create_arr_job(
-    session: Session,
-    *,
-    name: str,
-    arr_instance_id: int,
-    ttl_seconds: int,
-    schedule_cron: str | None,
-) -> dict:
-    job = Job(
-        name=name,
-        type=JobType.ARR,
-        ttl_seconds=ttl_seconds,
-        schedule_cron=schedule_cron,
-        config=json.dumps({"arr_instance_id": arr_instance_id}),
-    )
-    session.add(job)
-    session.flush()
-    return _job_dict(session, job)

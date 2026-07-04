@@ -34,26 +34,19 @@ class Setting(SQLModel, table=True):
     updated_at: str = Field(default_factory=clock.iso_now)
 
 
-class Job(SQLModel, table=True):
-    __tablename__ = "jobs"
-    id: int | None = Field(default=None, primary_key=True)
-    name: str
-    type: JobType = Field(default=JobType.PATH, sa_column=enum_col(JobType))
-    enabled: bool = True
-    ttl_seconds: int = 30 * 86_400
-    schedule_cron: str | None = None
-    config: str = "{}"  # JSON: {"root_path": ...}
-    concurrency: int | None = None
-    auto_replace: bool = False
-    auto_approve_replacements: bool = False
-    created_at: str = Field(default_factory=clock.iso_now)
-    updated_at: str = Field(default_factory=clock.iso_now)
-
-
 class JobRun(SQLModel, table=True):
+    """A run (job instance). Jobs live only in the YAML registry (no `jobs` table),
+    so the run snapshots everything needed for execution/display — it stays valid
+    even if the job is later removed from the config."""
+
     __tablename__ = "job_runs"
     id: int | None = Field(default=None, primary_key=True)
-    job_id: int = Field(foreign_key="jobs.id", index=True)
+    job_slug: str = Field(index=True)  # deterministic job identifier (not an FK)
+    job_name: str = ""
+    job_type: JobType = Field(default=JobType.PATH, sa_column=enum_col(JobType))
+    job_config: str = "{}"  # JSON snapshot: {"root_path": ...} | {"arr_instance_id": ...}
+    ttl_seconds: int = 0
+    auto_replace: bool = False
     status: RunStatus = Field(default=RunStatus.QUEUED, sa_column=enum_col(RunStatus))
     trigger: RunTrigger = Field(default=RunTrigger.MANUAL, sa_column=enum_col(RunTrigger))
     started_at: str | None = None

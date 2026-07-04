@@ -11,13 +11,15 @@ import shutil
 from pathlib import Path
 
 import pytest
+from specs import path_spec
 from sqlmodel import Session, select
 
 from scanrr.core.config import RuntimeConfig
 from scanrr.core.events import EventBus
+from scanrr.core.fileconfig import JobSpec
 from scanrr.db import engine as db_engine
 from scanrr.db.database import Database
-from scanrr.db.models import Detection, Job, JobRun, RunFile, ScanTask, ScanTaskSubscriber
+from scanrr.db.models import Detection, JobRun, RunFile, ScanTask, ScanTaskSubscriber
 from scanrr.enums import DetectorStatus, Disposition, RunStatus, TaskStatus, Verdict
 from scanrr.scanning.executor import InlineExecutor, PebbleExecutor
 from scanrr.scanning.hashing import hash_file as real_hash
@@ -34,14 +36,14 @@ def eng(tmp_path):
     return e
 
 
-def make_job(eng, root: Path, *, ttl_seconds: int = 0) -> int:
-    with Session(eng) as s:
-        job = Job(name="t", ttl_seconds=ttl_seconds, config=json.dumps({"root_path": str(root)}))
-        s.add(job)
-        s.commit()
-        s.refresh(job)
-        assert job.id is not None
-        return job.id
+def make_job(root: Path, *, ttl_seconds: int = 0) -> JobSpec:
+    return path_spec(root, ttl_seconds=ttl_seconds)
+
+
+def orchestrator(eng, spec: JobSpec, executor, **kwargs) -> Orchestrator:
+    return Orchestrator(
+        Database(eng), executor, CFG, yaml_jobs={spec.slug: spec}, poll_interval=0.02, **kwargs
+    )
 
 
 def lib_with(tmp_path: Path, media: dict, **names: str) -> Path:
@@ -101,15 +103,16 @@ class AlwaysTransientExecutor:
 
 async def test_full_run_inline(eng, media, tmp_path):
     lib = lib_with(tmp_path, media, good="clean", bad="bitflip")
-    job_id = make_job(eng, lib)
-    orch = Orchestrator(Database(eng), InlineExecutor(), CFG, poll_interval=0.02)
+    spec = make_job(lib)
+    orch = orchestrator(eng, spec, InlineExecutor())
     await orch.start()
     try:
-        run_id = await orch.trigger_run(job_id)
+        run_id = await orch.trigger_run(spec.slug)
         assert await orch.wait_for_run(run_id, timeout=15) == RunStatus.COMPLETED
         with Session(eng) as s:
             run = s.get(JobRun, run_id)
             assert run.files_scanned == 2 and run.files_corrupt == 1
+            assert run.job_name == spec.name  # snapshotted onto the run
             assert len(s.exec(select(Detection)).all()) == 1
     finally:
         await orch.stop()
@@ -117,12 +120,12 @@ async def test_full_run_inline(eng, media, tmp_path):
 
 async def test_concurrency_is_bounded(eng, media, tmp_path):
     lib = lib_with(tmp_path, media, a="clean", b="bitflip", c="truncated", d="header")
-    job_id = make_job(eng, lib)
+    spec = make_job(lib)
     executor = GatedExecutor()
-    orch = Orchestrator(Database(eng), executor, CFG, poll_interval=0.02)  # max_workers=2
+    orch = orchestrator(eng, spec, executor)  # max_workers=2
     await orch.start()
     try:
-        run_id = await orch.trigger_run(job_id)
+        run_id = await orch.trigger_run(spec.slug)
         await executor.await_started(2)          # exactly two decodes get going
         await asyncio.sleep(0.1)                  # give any (wrongly) extra one a chance
         assert executor.started == 2
@@ -137,11 +140,11 @@ async def test_concurrency_is_bounded(eng, media, tmp_path):
 
 async def test_transient_exhaustion_is_unreadable(eng, media, tmp_path):
     lib = lib_with(tmp_path, media, x="clean")
-    job_id = make_job(eng, lib)
-    orch = Orchestrator(Database(eng), AlwaysTransientExecutor(), CFG, poll_interval=0.02)
+    spec = make_job(lib)
+    orch = orchestrator(eng, spec, AlwaysTransientExecutor())
     await orch.start()
     try:
-        run_id = await orch.trigger_run(job_id)
+        run_id = await orch.trigger_run(spec.slug)
         assert await orch.wait_for_run(run_id, timeout=15) == RunStatus.COMPLETED
         with Session(eng) as s:
             run = s.get(JobRun, run_id)
@@ -154,12 +157,12 @@ async def test_transient_exhaustion_is_unreadable(eng, media, tmp_path):
 
 async def test_cancel_run_terminates_inflight(eng, media, tmp_path):
     lib = lib_with(tmp_path, media, a="clean")
-    job_id = make_job(eng, lib)
+    spec = make_job(lib)
     executor = GatedExecutor()
-    orch = Orchestrator(Database(eng), executor, CFG, poll_interval=0.02)
+    orch = orchestrator(eng, spec, executor)
     await orch.start()
     try:
-        run_id = await orch.trigger_run(job_id)
+        run_id = await orch.trigger_run(spec.slug)
         await executor.await_started(1)           # decode is in-flight, gated
         await orch.cancel_run(run_id)
         with Session(eng) as s:
@@ -174,10 +177,13 @@ async def test_cancel_run_terminates_inflight(eng, media, tmp_path):
 async def test_crash_recovery_resumes_scanning_task(eng, media, tmp_path):
     lib = lib_with(tmp_path, media, good="clean")
     path = str(lib / "good.mkv")
-    job_id = make_job(eng, lib)
+    spec = make_job(lib)
     # Simulate a crash mid-scan: a RUNNING run with a SCANNING task + subscription.
     with Session(eng) as s:
-        run = JobRun(job_id=job_id, status=RunStatus.RUNNING, started_at="2020-01-01T00:00:00Z")
+        run = JobRun(
+            job_slug=spec.slug, job_name=spec.name, status=RunStatus.RUNNING,
+            started_at="2020-01-01T00:00:00Z",
+        )
         s.add(run)
         s.flush()
         task = ScanTask(seq=1, path=path, status=TaskStatus.SCANNING)
@@ -188,7 +194,7 @@ async def test_crash_recovery_resumes_scanning_task(eng, media, tmp_path):
         s.commit()
         run_id = run.id
 
-    orch = Orchestrator(Database(eng), InlineExecutor(), CFG, poll_interval=0.02)
+    orch = orchestrator(eng, spec, InlineExecutor())
     await orch.start()  # recover_interrupted flips scanning → pending, drain resumes
     try:
         assert await orch.wait_for_run(run_id, timeout=15) == RunStatus.COMPLETED
@@ -202,8 +208,8 @@ async def test_crash_recovery_resumes_scanning_task(eng, media, tmp_path):
 async def test_orchestrator_publishes_events(eng, media, tmp_path):
     bus = EventBus()
     lib = lib_with(tmp_path, media, good="clean", bad="bitflip")
-    job_id = make_job(eng, lib)
-    orch = Orchestrator(Database(eng), InlineExecutor(), CFG, bus=bus, poll_interval=0.02)
+    spec = make_job(lib)
+    orch = orchestrator(eng, spec, InlineExecutor(), bus=bus)
     await orch.start()
 
     events: list[dict] = []
@@ -218,7 +224,7 @@ async def test_orchestrator_publishes_events(eng, media, tmp_path):
     consumer = asyncio.create_task(consume())
     await asyncio.sleep(0.05)  # let the consumer subscribe before we publish
     try:
-        await orch.trigger_run(job_id)
+        await orch.trigger_run(spec.slug)
         await asyncio.wait_for(consumer, timeout=15)
     finally:
         consumer.cancel()
@@ -234,11 +240,11 @@ async def test_orchestrator_publishes_events(eng, media, tmp_path):
 @pytest.mark.requires_ffmpeg
 async def test_pebble_pool_end_to_end(eng, media, tmp_path):
     lib = lib_with(tmp_path, media, good="clean", bad="bitflip")
-    job_id = make_job(eng, lib)
-    orch = Orchestrator(Database(eng), PebbleExecutor(2), CFG, poll_interval=0.02)
+    spec = make_job(lib)
+    orch = orchestrator(eng, spec, PebbleExecutor(2))
     await orch.start()
     try:
-        run_id = await orch.trigger_run(job_id)
+        run_id = await orch.trigger_run(spec.slug)
         assert await orch.wait_for_run(run_id, timeout=30) == RunStatus.COMPLETED
         with Session(eng) as s:
             run = s.get(JobRun, run_id)

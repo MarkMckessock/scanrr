@@ -11,10 +11,11 @@ test("dashboard renders stats, health bar and recent runs", async ({ page }) => 
   await page.screenshot({ path: shot("dashboard"), fullPage: true });
 });
 
-test("jobs page lists the seeded job and its actions", async ({ page }) => {
+test("jobs page lists the YAML job read-only", async ({ page }) => {
   await page.goto("/jobs");
   await expect(page.getByRole("heading", { name: "Jobs" })).toBeVisible();
   await expect(page.getByText("Movies")).toBeVisible();
+  await expect(page.getByText("yaml").first()).toBeVisible();
   await expect(page.getByRole("button", { name: "Run" }).first()).toBeVisible();
   await page.screenshot({ path: shot("jobs"), fullPage: true });
 });
@@ -59,10 +60,11 @@ test("sidebar navigation works via client routing", async ({ page }) => {
   await expect(page.getByRole("heading", { name: "Jobs" })).toBeVisible();
 });
 
-test("creating a job through the form adds it to the table", async ({ page }) => {
+test("generate job YAML modal renders a stanza", async ({ page }) => {
   await page.goto("/jobs");
-  await page.getByPlaceholder("name").fill("E2E Job");
-  await page.getByPlaceholder("/mnt/media/movies").fill("/tmp/e2e-library");
-  await page.getByRole("button", { name: "Create" }).click();
-  await expect(page.getByText("E2E Job")).toBeVisible();
+  await page.getByPlaceholder("name").fill("My Movies");
+  await page.getByPlaceholder("/mnt/media/movies").fill("/mnt/movies");
+  await page.getByRole("button", { name: "Generate YAML" }).click();
+  await expect(page.getByText("Job config (YAML)")).toBeVisible();
+  await expect(page.getByText(/name: My Movies/)).toBeVisible();
 });

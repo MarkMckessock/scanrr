@@ -14,20 +14,22 @@ export interface RunSummary {
 }
 
 export interface Job {
-  id: number;
+  slug: string;
   name: string;
   type: string;
   enabled: boolean;
   ttl_seconds: number;
   schedule_cron: string | null;
   root_path: string | null;
+  arr_instance_id: number | null;
   auto_replace: boolean;
   last_run: RunSummary | null;
 }
 
 export interface Run {
   id: number;
-  job_id: number;
+  job_slug: string;
+  job_name: string;
   status: string;
   trigger: string;
   files_discovered: number;
@@ -96,12 +98,7 @@ const post = <T>(path: string, body?: unknown) =>
 export const api = {
   stats: () => req<Stats>("/stats"),
   jobs: () => req<Job[]>("/jobs"),
-  createJob: (body: { name: string; root_path: string; ttl_days: number; schedule_cron: string | null }) =>
-    post<Job>("/jobs", body),
-  updateJob: (id: number, body: Partial<{ enabled: boolean; name: string; schedule_cron: string | null }>) =>
-    req<Job>(`/jobs/${id}`, { method: "PUT", body: JSON.stringify(body) }),
-  deleteJob: (id: number) => req<{ deleted: number }>(`/jobs/${id}`, { method: "DELETE" }),
-  runJob: (id: number) => post<{ run_id: number }>(`/jobs/${id}/run`),
+  runJob: (slug: string) => post<{ run_id: number }>(`/jobs/${slug}/run`),
   runs: () => req<Run[]>("/runs"),
   run: (id: number) => req<Run>(`/runs/${id}`),
   runFiles: (id: number) => req<RunFile[]>(`/runs/${id}/files`),

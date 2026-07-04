@@ -18,6 +18,7 @@ from sqlmodel import Session
 
 from scanrr.core.config import RuntimeConfig
 from scanrr.core.events import EventBus
+from scanrr.core.fileconfig import JobSpec
 from scanrr.db.database import Database
 from scanrr.enums import DetectorStatus, JobType, RunTrigger, Verdict
 from scanrr.integrations.arr import apply_path_mapping, make_client
@@ -36,12 +37,14 @@ class Orchestrator:
         config: RuntimeConfig,
         *,
         bus: EventBus | None = None,
+        yaml_jobs: dict[str, JobSpec] | None = None,
         poll_interval: float = 0.5,
     ) -> None:
         self.db = db
         self.executor = executor
         self.config = config
         self._bus = bus
+        self._yaml_jobs: dict[str, JobSpec] = yaml_jobs or {}  # keyed by slug
         self._poll_interval = poll_interval
         self._max_workers = config.max_scan_workers
         self._inflight: dict[int, asyncio.Task[None]] = {}
@@ -69,27 +72,24 @@ class Orchestrator:
 
     # --- run control -------------------------------------------------------- #
 
-    async def trigger_run(self, job_id: int, trigger: RunTrigger = RunTrigger.SCHEDULED) -> int:
-        def _info(session: Session) -> engine.JobInfo | None:
-            return engine.job_info(session, job_id)
-
-        info = await self.db.run(_info)
-        if info is None:
-            raise ValueError(f"job {job_id} not found")
+    async def trigger_run(self, slug: str, trigger: RunTrigger = RunTrigger.SCHEDULED) -> int:
+        spec = self._yaml_jobs.get(slug)
+        if spec is None:
+            raise ValueError(f"job {slug!r} not found")
         # arr enumeration is network I/O — do it here (async), off the DB thread.
-        candidates = await self._arr_discover(info) if info.type is JobType.ARR else None
+        candidates = await self._arr_discover(spec) if spec.type is JobType.ARR else None
 
         def _start(session: Session) -> int:
-            return engine.start_run(session, job_id, trigger, self.config, candidates)
+            return engine.start_run(session, spec, trigger, self.config, candidates)
 
         run_id = await self.db.run(_start)
         await self._publish_run_started(run_id)
         self._wake.set()
         return run_id
 
-    async def _arr_discover(self, info: engine.JobInfo) -> list[engine.ArrCandidate]:
+    async def _arr_discover(self, spec: JobSpec) -> list[engine.ArrCandidate]:
         """Enumerate an arr instance and map its paths to local candidates (SPEC §9)."""
-        instance_id = int(json.loads(info.config)["arr_instance_id"])
+        instance_id = int(json.loads(spec.config)["arr_instance_id"])
 
         def _inst(session: Session) -> engine.ArrInstanceInfo | None:
             return engine.get_arr_instance_info(session, instance_id)
@@ -99,7 +99,7 @@ class Orchestrator:
 
         inst = await self.db.run(_inst)
         if inst is None:
-            _log.warning("arr instance %d missing/disabled for job %d", instance_id, info.id)
+            _log.warning("arr instance %d missing/disabled for job %r", instance_id, spec.slug)
             return []
         mappings = await self.db.run(_maps)
         client = make_client(inst.type, inst.base_url, inst.api_key)

@@ -20,10 +20,10 @@ from sqlmodel import Session
 
 from scanrr.core.config import DEFAULTS, settings
 from scanrr.core.events import EventBus
+from scanrr.core.fileconfig import load_file_config
 from scanrr.core.logging import configure as configure_logging
 from scanrr.db.database import Database
 from scanrr.db.engine import get_engine, init_db
-from scanrr.db.models import Job
 from scanrr.enums import ArrType, DetectionStatus, RunTrigger
 from scanrr.integrations.arr import make_client
 from scanrr.jobs.scheduler import Scheduler
@@ -44,14 +44,20 @@ _TRIAGE = {
 async def lifespan(app: FastAPI):
     configure_logging()
     init_db()
+    # YAML config (settings override + in-memory jobs) is the IaC source of truth.
+    config, yaml_specs = load_file_config(settings.config_file, DEFAULTS)
+    yaml_registry = {spec.slug: spec for spec in yaml_specs}
     db = Database(get_engine())
     bus = EventBus()
-    orchestrator = Orchestrator(db, PebbleExecutor(DEFAULTS.max_scan_workers), DEFAULTS, bus=bus)
+    orchestrator = Orchestrator(
+        db, PebbleExecutor(config.max_scan_workers), config, bus=bus, yaml_jobs=yaml_registry
+    )
     await orchestrator.start()
-    scheduler = Scheduler(orchestrator, db, DEFAULTS)
+    scheduler = Scheduler(orchestrator, db, config, yaml_jobs=yaml_specs)
     await scheduler.start()
     app.state.db, app.state.bus = db, bus
     app.state.orchestrator, app.state.scheduler = orchestrator, scheduler
+    app.state.config, app.state.yaml_specs = config, yaml_specs
     try:
         yield
     finally:
@@ -70,22 +76,6 @@ def require_token(x_scanrr_token: str | None = Header(default=None)) -> None:
 
 def _db(request: Request) -> Database:
     return request.app.state.db
-
-
-class JobCreate(BaseModel):
-    name: str
-    root_path: str | None = None
-    arr_instance_id: int | None = None  # set for an arr job instead of root_path
-    ttl_days: int = 30
-    schedule_cron: str | None = None
-
-
-class JobUpdate(BaseModel):
-    name: str | None = None
-    enabled: bool | None = None
-    ttl_seconds: int | None = None
-    schedule_cron: str | None = None
-    auto_replace: bool | None = None
 
 
 class ArrInstanceCreate(BaseModel):
@@ -111,12 +101,19 @@ def health() -> dict[str, str]:
 
 @app.get("/api/stats")
 async def get_stats(request: Request) -> dict:
-    return await _db(request).run(engine.stats)
+    stats = await _db(request).run(engine.stats)
+    stats["jobs"] = len(request.app.state.yaml_specs)  # jobs live in the YAML registry
+    return stats
 
 
 @app.get("/api/jobs")
 async def list_jobs(request: Request) -> list[dict]:
-    return await _db(request).run(engine.list_jobs)
+    yaml_specs = request.app.state.yaml_specs
+
+    def _list(session: Session) -> list[dict]:
+        return engine.list_jobs(session, yaml_specs)
+
+    return await _db(request).run(_list)
 
 
 @app.get("/api/runs")
@@ -143,63 +140,22 @@ async def list_detections(request: Request, status: DetectionStatus | None = Non
 
 
 @app.get("/api/settings")
-def get_settings() -> dict:
-    return DEFAULTS.model_dump(mode="json")
+def get_settings(request: Request) -> dict:
+    return request.app.state.config.model_dump(mode="json")
 
 
 # --- actions ---------------------------------------------------------------- #
 
 
-@app.post("/api/jobs", dependencies=[Depends(require_token)])
-async def create_job(body: JobCreate, request: Request) -> dict:
-    if (body.root_path is None) == (body.arr_instance_id is None):
-        raise HTTPException(
-            status.HTTP_400_BAD_REQUEST, "provide exactly one of root_path or arr_instance_id"
-        )
-
-    def _create(session: Session) -> dict:
-        if body.arr_instance_id is not None:
-            return engine.create_arr_job(
-                session,
-                name=body.name,
-                arr_instance_id=body.arr_instance_id,
-                ttl_seconds=body.ttl_days * 86_400,
-                schedule_cron=body.schedule_cron,
-            )
-        assert body.root_path is not None
-        return engine.create_job(
-            session,
-            name=body.name,
-            root_path=body.root_path,
-            ttl_seconds=body.ttl_days * 86_400,
-            schedule_cron=body.schedule_cron,
-        )
-
-    return await _db(request).run(_create)
+# Jobs are defined in the YAML config (read-only) — no create/update/delete here.
 
 
-@app.put("/api/jobs/{job_id}", dependencies=[Depends(require_token)])
-async def update_job(job_id: int, body: JobUpdate, request: Request) -> dict:
-    fields = body.model_dump(exclude_unset=True)
-    result = await _db(request).run(lambda s: engine.update_job(s, job_id, fields))
-    if result is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "job not found")
-    return result
-
-
-@app.delete("/api/jobs/{job_id}", dependencies=[Depends(require_token)])
-async def delete_job(job_id: int, request: Request) -> dict:
-    ok = await _db(request).run(lambda s: engine.delete_job(s, job_id))
-    if not ok:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "job not found")
-    return {"deleted": job_id}
-
-
-@app.post("/api/jobs/{job_id}/run", dependencies=[Depends(require_token)])
-async def trigger_run(job_id: int, request: Request) -> dict:
-    if await _db(request).run(lambda s: s.get(Job, job_id)) is None:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "job not found")
-    run_id = await request.app.state.orchestrator.trigger_run(job_id, RunTrigger.MANUAL)
+@app.post("/api/jobs/{slug}/run", dependencies=[Depends(require_token)])
+async def trigger_run(slug: str, request: Request) -> dict:
+    try:
+        run_id = await request.app.state.orchestrator.trigger_run(slug, RunTrigger.MANUAL)
+    except ValueError as exc:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "job not found") from exc
     return {"run_id": run_id}
 
 

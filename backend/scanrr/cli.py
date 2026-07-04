@@ -8,9 +8,10 @@ import typer
 from sqlmodel import Session, select
 
 from scanrr.core.config import RuntimeConfig
+from scanrr.core.fileconfig import JobSpec, slugify
 from scanrr.core.logging import configure as configure_logging
 from scanrr.db.engine import get_engine, init_db
-from scanrr.db.models import Detection, File, Job
+from scanrr.db.models import Detection, File
 from scanrr.enums import DetectionStatus, JobType
 from scanrr.scanning.engine import run_job
 
@@ -42,20 +43,20 @@ def scan(
     """Scan a directory tree for corrupt media."""
     configure_logging()
     init_db()
+    spec = JobSpec(
+        slug=f"cli-{slugify(path)}",
+        name=f"cli:{path}",
+        type=JobType.PATH,
+        config=json.dumps({"root_path": path}),
+        ttl_seconds=ttl_days * 86_400,
+        schedule_cron=None,
+        enabled=True,
+        auto_replace=False,
+    )
     with Session(get_engine()) as session:
-        job = Job(
-            name=f"cli:{path}",
-            type=JobType.PATH,
-            ttl_seconds=ttl_days * 86_400,
-            config=json.dumps({"root_path": path}),
-        )
-        session.add(job)
-        session.commit()
-        session.refresh(job)
-
         run = run_job(
             session,
-            job,
+            spec,
             config=RuntimeConfig(min_file_age_seconds=min_age, min_file_size_bytes=min_size),
         )
 

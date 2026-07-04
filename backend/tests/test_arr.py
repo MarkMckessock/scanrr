@@ -7,6 +7,7 @@ import shutil
 
 import httpx
 import pytest
+from specs import arr_spec
 from sqlmodel import Session, select
 
 from scanrr.core.config import RuntimeConfig
@@ -113,11 +114,9 @@ async def test_arr_job_discovers_maps_and_links(eng, media, tmp_path, monkeypatc
         engine.create_path_mapping(
             s, arr_instance_id=inst["id"], remote_path="/data/movies", local_path=str(lib)
         )
-        job = engine.create_arr_job(
-            s, name="Movies", arr_instance_id=inst["id"], ttl_seconds=0, schedule_cron=None
-        )
         s.commit()
-        job_id = job["id"]
+        instance_id = inst["id"]
+    spec = arr_spec(instance_id, name="Movies")
 
     class FakeClient:
         async def list_media_files(self):
@@ -133,10 +132,12 @@ async def test_arr_job_discovers_maps_and_links(eng, media, tmp_path, monkeypatc
         "scanrr.scanning.orchestrator.make_client", lambda *a, **k: FakeClient()
     )
 
-    orch = Orchestrator(Database(eng), InlineExecutor(), CFG, poll_interval=0.02)
+    orch = Orchestrator(
+        Database(eng), InlineExecutor(), CFG, yaml_jobs={spec.slug: spec}, poll_interval=0.02
+    )
     await orch.start()
     try:
-        run_id = await orch.trigger_run(job_id)
+        run_id = await orch.trigger_run(spec.slug)
         assert await orch.wait_for_run(run_id, timeout=15) == RunStatus.COMPLETED
         with Session(eng) as s:
             links = s.exec(select(FileArrLink)).all()

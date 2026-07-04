@@ -49,6 +49,8 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="SCANRR_", env_file=".env", extra="ignore")
 
     database_url: str = "sqlite:///scanrr.db"
+    # YAML config file (settings + jobs) read at startup. Empty = disabled.
+    config_file: str = ""
     log_level: str = "INFO"
     # Shared secret required on mutating API routes (SPEC §11/§14). Empty = off (dev).
     api_token: str = ""
