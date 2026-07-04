@@ -15,6 +15,65 @@
 > global path-deduplicated queue (§6), human-approval gate for replacements (§9),
 > bounded polling of arr (§9), and a queued/periodically-flushed notification
 > pipeline (§10). Schema updated accordingly (§8).
+>
+> **v0.4 — configuration as code.** Jobs **and** arr instances are now defined in a
+> mounted YAML config file (§0), held in memory as the **sole source of truth** —
+> read-only in the app. This removes the `jobs`, `arr_instances`, and
+> `path_mappings` tables (§8); jobs are referenced by a deterministic **slug** and
+> a run snapshots its job definition (self-contained). Arr instances are referenced
+> by **name**, carry their own path mappings, and their API keys live in the mounted
+> config (a k8s Secret) — so **app-level secret encryption is removed** (§14).
+
+---
+
+## 0. Configuration as Code (YAML)
+
+scanrr is configured by a single **YAML file** mounted into the container (path from
+`SCANRR_CONFIG_FILE`, e.g. a Kubernetes ConfigMap/Secret at `/config/scanrr.yaml`).
+It is read **once at startup** and is **read-only** in the app — a pod restart
+re-applies changes (the GitOps loop). It is the **sole source of truth** for
+settings, jobs, and arr instances; none of these are persisted in the DB.
+
+```yaml
+settings:                      # override any RuntimeConfig tunable (§13)
+  max_scan_workers: 4
+  detector_backend: subprocess
+
+radarr:                        # zero or more Radarr instances
+  - name: main                 # globally unique across sonarr+radarr
+    url: http://radarr:7878
+    api_key: <key>             # secret — put the whole file in a k8s Secret (§14)
+    mappings:                  # arr-namespace path → scanrr mount
+      - { from: /data/media/movies, to: /mnt/movies }
+sonarr:                        # zero or more Sonarr instances (same shape)
+  - name: tv
+    url: http://sonarr:8989
+    api_key: <key>
+    mappings: [{ from: /data/media/tv, to: /mnt/tv }]
+
+jobs:
+  - name: Movies               # slug = slugify(name), unique; used in routes/runs
+    type: path
+    root_path: /mnt/movies
+    ttl_days: 30
+    schedule_cron: "0 3 * * *"
+  - name: TV
+    type: arr
+    arr_instance: tv           # reference an instance by name
+    ttl_days: 14
+```
+
+- **Jobs** are held in an in-memory registry keyed by `slug` (a deterministic slug
+  of the name). A run **snapshots** its job's definition (§8 `job_runs`), so run
+  history renders and remains valid even after a job is removed from the YAML.
+- **Arr instances** are held in a registry keyed by `name`; each carries its own
+  `mappings`. Jobs of `type: arr` reference an instance by name.
+- **Precedence:** code `DEFAULTS` → YAML `settings:`. A missing/empty file is a
+  no-op (defaults, no jobs/instances).
+- The **CLI** `scanrr scan <path>` builds a *transient* in-memory job (not
+  persisted) for one-off scans.
+- The **UI** shows jobs and instances read-only, plus a "Generate job YAML" helper
+  that emits a stanza to paste into the config (§12).
 
 ---
 
@@ -55,21 +114,25 @@ re-does completed work.
 
 | Concept | Meaning |
 |---|---|
-| **Job** | A reusable, configurable unit of work: a source (path or arr instance) + TTL + schedule + options. Defines *what* to scan and *how often*. |
-| **Job Run** | One execution of a Job. Has discovery + scan phases and aggregate stats. |
+| **Job** | A `path` or `arr` scan target defined in the YAML config (§0): source + TTL + schedule + options. Held in memory (no DB row), referenced by a deterministic **slug**, and **read-only** in the app. |
+| **Job Run** | One execution of a Job. **Snapshots** the job definition (slug/name/type/config/ttl/auto_replace) so it stays self-contained if the job is later removed from the YAML. |
 | **Scan Task** | One file's work item on the **global, path-deduplicated** queue. Shared across runs (many runs may subscribe); processed once. |
 | **Run File** | A run's per-file ledger entry (disposition + outcome) — how each run "sees" the shared work, incl. skips. |
 | **File** | A path on disk: its current hash, size, mtime, and last-scan bookkeeping. |
 | **Scan Result** | Content-addressed (keyed by hash) ffmpeg verdict: `ok` / `corrupt`. The reusable cache. Transient `error`/`timeout` outcomes are *not* stored here. |
 | **Detection** | A corrupt file observed at a path, with remediation state (open → resolved). What the user triages. |
 | **Replacement** | An attempt to re-acquire a corrupt file via Sonarr/Radarr. |
-| **Arr Instance** | A configured Sonarr or Radarr endpoint (URL + API key). |
-| **Path Mapping** | Translates an arr-namespace path to scanrr's local mount path. |
+| **Arr Instance** | A Sonarr/Radarr endpoint (name + URL + API key + path mappings) defined in the YAML config (§0). Held in memory, referenced by **name**, read-only in the app. |
 
 **Key invariant:** `Scan Result` is keyed by **content hash**, valid only for a
 given **detector version + backend**, never by path. `File` maps path → hash.
 `Detection` maps a corrupt observation → remediation. This separation is what
 makes cross-path dedup and idempotent resume fall out naturally.
+
+**Jobs and arr instances are configuration, not data** — they live only in the
+mounted YAML (§0), never in the DB. The DB holds *runtime state* (runs, tasks,
+files, results, detections, replacements); a run persists its job as a snapshot so
+history survives config changes.
 
 ---
 
@@ -321,8 +384,8 @@ reaches a terminal `outcome` and **finalization always progresses** (no orphaned
 run waiting on a vanished task).
 
 ### Lifecycle of a run
-1. **Trigger** — scheduler (cron) or manual (`POST /api/jobs/:id/run`) creates a
-   `job_run` (`queued`), then `running`.
+1. **Trigger** — scheduler (cron) or manual (`POST /api/jobs/:slug/run`) resolves the
+   job from the YAML registry and creates a `job_run` (snapshotting the job def).
 2. **Discovery** — resolve the source to a file list (walk dir, or query arr +
    apply path mappings); apply §3 **stat-only** pre-checks. Stability/TTL skips are
    recorded against the run immediately; every other file is enqueued/subscribed on
@@ -423,35 +486,28 @@ and all subscribing runs have finalized (the per-run record lives on in `run_fil
 `notification_queue` rows are deleted after a successful flush.
 
 ```sql
--- Global key/value config (concurrency, hash algo, detector backend, ext list…)
+-- NB: there is NO `jobs` table and NO `arr_instances`/`path_mappings` tables —
+-- jobs and arr instances are defined in the YAML config (§0) and held in memory.
+-- The DB stores only runtime STATE. A run snapshots its job (see job_runs).
+
+-- Key/value settings table: reserved for future runtime overrides. Currently
+-- unused — effective config comes from DEFAULTS + the YAML `settings:` stanza (§0).
 CREATE TABLE settings (
     key         TEXT PRIMARY KEY,
     value       TEXT NOT NULL,               -- JSON-encoded
     updated_at  TEXT NOT NULL
 );
 
--- Job definitions
-CREATE TABLE jobs (
-    id            INTEGER PRIMARY KEY,
-    name          TEXT NOT NULL,
-    type          TEXT NOT NULL CHECK (type IN ('path','arr')),
-    enabled       INTEGER NOT NULL DEFAULT 1,
-    ttl_seconds   INTEGER NOT NULL,          -- rescan window
-    schedule_cron TEXT,                      -- NULL = manual only
-    config        TEXT NOT NULL,             -- JSON: {root_path} | {arr_instance_id}
-    concurrency   INTEGER,                   -- NULL = use global default
-    auto_replace  INTEGER NOT NULL DEFAULT 0,  -- enable arr re-request on corruption
-    auto_approve_replacements INTEGER NOT NULL DEFAULT 0,
-                  -- 0 = require human approval before deleting (default, Q3);
-                  -- 1 = user opted to bypass approval and execute automatically
-    created_at    TEXT NOT NULL,
-    updated_at    TEXT NOT NULL
-);
-
--- One execution of a job
+-- One execution of a job. Carries a SNAPSHOT of the job definition (§0) so the run
+-- is self-contained and renders even if the job is removed from the YAML.
 CREATE TABLE job_runs (
     id                 INTEGER PRIMARY KEY,
-    job_id             INTEGER NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+    job_slug           TEXT NOT NULL,           -- deterministic job id (not an FK)
+    job_name           TEXT NOT NULL DEFAULT '',
+    job_type           TEXT NOT NULL,           -- path | arr
+    job_config         TEXT NOT NULL DEFAULT '{}',  -- JSON: {root_path}|{arr_instance}
+    ttl_seconds        INTEGER NOT NULL DEFAULT 0,
+    auto_replace       INTEGER NOT NULL DEFAULT 0,
     status             TEXT NOT NULL           -- queued|running|completed|failed|
                        DEFAULT 'queued',       --   cancelling|cancelled|interrupted
     trigger            TEXT NOT NULL,           -- manual | scheduled
@@ -464,7 +520,7 @@ CREATE TABLE job_runs (
     files_unreadable   INTEGER NOT NULL DEFAULT 0,   -- transient failures exhausted
     error_message      TEXT
 );
-CREATE INDEX ix_job_runs_job ON job_runs(job_id, started_at);
+CREATE INDEX ix_job_runs_job ON job_runs(job_slug, id);
 
 -- Global, path-deduplicated scan queue shared by ALL runs (Q2). One row per file
 -- currently needing work; unique by path while active so overlapping jobs never
@@ -562,43 +618,27 @@ CREATE TABLE detections (
 CREATE INDEX ix_detections_status ON detections(status);
 CREATE INDEX ix_detections_file ON detections(file_id);
 
--- Sonarr/Radarr endpoints
-CREATE TABLE arr_instances (
-    id         INTEGER PRIMARY KEY,
-    type       TEXT NOT NULL CHECK (type IN ('sonarr','radarr')),
-    name       TEXT NOT NULL,
-    base_url   TEXT NOT NULL,
-    api_key    TEXT NOT NULL,                 -- encrypted at rest (§14)
-    enabled    INTEGER NOT NULL DEFAULT 1,
-    created_at TEXT NOT NULL
-);
+-- (No arr_instances / path_mappings tables — arr instances + their mappings are
+--  defined in the YAML config (§0), held in memory, referenced by name.)
 
--- arr-namespace path -> scanrr local mount path (longest-prefix match)
-CREATE TABLE path_mappings (
-    id               INTEGER PRIMARY KEY,
-    arr_instance_id  INTEGER NOT NULL REFERENCES arr_instances(id) ON DELETE CASCADE,
-    remote_path      TEXT NOT NULL,           -- e.g. /data/media/tv
-    local_path       TEXT NOT NULL            -- e.g. /mnt/tv
-);
-
--- Links a scanned file to its arr media item (populated during arr discovery)
+-- Links a scanned file to its arr media item (populated during arr discovery).
 CREATE TABLE file_arr_links (
     file_id          INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
-    arr_instance_id  INTEGER NOT NULL REFERENCES arr_instances(id) ON DELETE CASCADE,
+    arr_instance     TEXT NOT NULL,           -- YAML arr instance name (not an FK)
     media_type       TEXT NOT NULL,           -- episode | movie
     media_id         INTEGER NOT NULL,        -- series/episode or movie id
     arr_file_id      INTEGER NOT NULL,        -- episodeFile / movieFile id
-    PRIMARY KEY (file_id, arr_instance_id)
+    PRIMARY KEY (file_id, arr_instance)
 );
 -- Reverse lookup used when arr history/webhook references a file by its arr id.
-CREATE INDEX ix_file_arr_links_arrfile ON file_arr_links(arr_instance_id, arr_file_id);
+CREATE INDEX ix_file_arr_links_arrfile ON file_arr_links(arr_instance, arr_file_id);
 
 -- Re-request attempts (one row per attempt; capped per detection -- §9, #6)
 CREATE TABLE replacements (
     id           INTEGER PRIMARY KEY,
     detection_id INTEGER NOT NULL REFERENCES detections(id) ON DELETE CASCADE,
     attempt      INTEGER NOT NULL DEFAULT 1,        -- 1..max_replace_attempts
-    arr_instance_id INTEGER REFERENCES arr_instances(id) ON DELETE SET NULL,
+    arr_instance TEXT,                              -- YAML arr instance name
     media_type   TEXT,
     media_id     INTEGER,
     arr_file_id  INTEGER,
@@ -622,7 +662,7 @@ CREATE INDEX ix_replacements_status ON replacements(status);  -- pending_approva
 CREATE TABLE notification_channels (
     id       INTEGER PRIMARY KEY,
     type     TEXT NOT NULL DEFAULT 'pushover',
-    config   TEXT NOT NULL,                   -- JSON {user_key, api_token, priority} (encrypted)
+    config   TEXT NOT NULL,                   -- JSON {user_key, api_token, priority}
     enabled  INTEGER NOT NULL DEFAULT 1
 );
 CREATE TABLE notification_rules (
@@ -662,14 +702,19 @@ CREATE TABLE notification_log (
 
 ## 9. Sonarr / Radarr Integration
 
+Arr instances are defined in the YAML config (§0), referenced by an arr job's
+`arr_instance: <name>`. Enumeration is **async httpx**, done in the orchestrator
+(off the DB thread) before the run's discovery.
+
 ### Discovery (arr-type jobs)
 - **Sonarr** (API v3): enumerate `GET /api/v3/series` → per series
   `GET /api/v3/episodefile?seriesId=…`; collect `episodeFile.path`, `episodeFileId`,
   episode id. **Radarr:** `GET /api/v3/movie` → `movieFile.path`, `movieFileId`,
   movie id.
 - **Path mapping:** arr returns paths in *its* namespace. Apply the longest-prefix
-  `path_mappings` rule for that instance to translate to scanrr's local mount, then
-  scan as usual. Record the arr linkage in `file_arr_links` so remediation is possible.
+  match from the **instance's `mappings`** (from the YAML) to translate to scanrr's
+  local mount, then scan as usual. Record the arr linkage in `file_arr_links`
+  (keyed by instance **name**) so remediation is possible.
 - Files that don't match any mapping (or aren't present on the mount) are flagged as
   discovery warnings, not scanned.
 
@@ -679,12 +724,12 @@ When a corrupt detection has an arr link and the job has `auto_replace`, the run
 
 1. **Propose & gate (Q3).** For each corrupt arr-linked file, create a
    `replacement` in `pending_approval` capturing the intended delete + search, and
-   enqueue a `replacement_pending_approval` notification (§10). If
-   the job has `auto_approve_replacements = 0` (**default**), the run completes and
-   the UI shows *"N files will be deleted & re-requested"* for the user to
-   **approve or reject** (individually or as a batch). If `auto_approve_replacements
-   = 1` (user explicitly opted to bypass), rows are auto-approved (`approved_by =
-   'auto'`) and proceed immediately. A **per-run deletion cap** (`max_deletions_per_run`,
+   enqueue a `replacement_pending_approval` notification (§10). By **default**
+   (the YAML job's `auto_approve` unset), the run completes and the UI shows
+   *"N files will be deleted & re-requested"* for the user to **approve or reject**
+   (individually or as a batch). If the job sets `auto_approve: true` (explicit
+   opt-out), rows are auto-approved (`approved_by = 'auto'`) and proceed immediately.
+   A **per-run deletion cap** (`max_deletions_per_run`,
    default 25) aborts and raises `needs_attention` if a single run would delete more
    than the cap — a guard against a path-mapping mistake, especially when approval
    is bypassed.
@@ -742,9 +787,8 @@ Base: `/api`. JSON throughout.
 
 | Method | Route | Purpose |
 |---|---|---|
-| GET/POST | `/jobs` | List / create jobs |
-| GET/PUT/DELETE | `/jobs/:id` | Read / update / delete a job |
-| POST | `/jobs/:id/run` | Trigger a run now |
+| GET | `/jobs` | List jobs (from the YAML registry — **read-only**) |
+| POST | `/jobs/:slug/run` | Trigger a run of a YAML job by slug |
 | GET | `/runs` · `/runs/:id` | Run history / detail + stats |
 | POST | `/runs/:id/cancel` | Cancel a running job |
 | GET | `/runs/:id/files` | This run's per-file ledger (`run_files`: disposition + outcome), paged |
@@ -755,12 +799,11 @@ Base: `/api`. JSON throughout.
 | POST | `/replacements/:id/approve` · `/reject` | Approve/reject a proposed deletion (Q3) |
 | POST | `/replacements/approve` | Bulk-approve a batch (body: ids or run id) |
 | GET | `/files` | Search scanned files (path/hash/status) |
-| GET/POST | `/arr-instances` · `/arr-instances/:id` | Manage arr endpoints |
-| POST | `/arr-instances/:id/test` | Connection test |
-| GET/POST/DELETE | `/path-mappings` | Manage path mappings |
-| GET/PUT | `/settings` | Global settings |
-| GET/PUT | `/notifications` | Channels + rules |
-| POST | `/notifications/test` | Send a test push |
+| GET | `/arr-instances` | List arr instances (from YAML — **read-only**, no api_key) |
+| POST | `/arr-instances/:name/test` | Connection test (by name) |
+| GET | `/settings` | Effective runtime config (DEFAULTS + YAML `settings:`) |
+| GET/PUT | `/notifications` | Channels + rules (M5) |
+| POST | `/notifications/test` | Send a test push (M5) |
 | POST | `/library/revalidate` | Re-scan against current detector (scope-previewed, rate-limited) (#7) |
 | GET | `/stats` | Dashboard aggregates |
 | GET | `/events` | **SSE** stream: run progress, task updates, new detections |
@@ -768,7 +811,7 @@ Base: `/api`. JSON throughout.
 | GET | `/health` | Liveness/readiness |
 
 **Auth (#9):** all **mutating** routes (POST/PUT/DELETE — especially the
-destructive `/detections/:id/replace` and `auto_replace` config) require a shared
+destructive `/detections/:id/replace` and replacement approvals) require a shared
 secret (`X-Scanrr-Token`, from an env/k8s Secret), enforced by middleware. GET
 routes and `/health`/`/metrics` are open behind Cloudflare Zero Trust. This is
 defense-in-depth against other in-cluster callers, not a user-auth system.
@@ -786,16 +829,12 @@ Modern, dark-mode-first, shadcn/ui components. Left nav + content.
 | Route | View | Contents |
 |---|---|---|
 | `/` | **Dashboard** | Active runs (live progress bars), library health donut (ok/corrupt/unreadable), recent runs, open-detection count, scan-throughput chart. |
-| `/jobs` | **Jobs** | Cards/table of jobs: type, schedule, TTL, last run, status; Run-now, enable/disable, edit, delete. |
-| `/jobs/new`, `/jobs/:id` | **Job editor** | Type (path/arr), source config, TTL, cron builder, concurrency, `auto_replace` + `auto_approve_replacements` toggles (with warning), + run history for existing jobs. |
+| `/jobs` | **Jobs** | **Read-only** table of YAML jobs (schedule, last run, Run-now) + a **"Generate job YAML"** helper that emits a config stanza to paste into the ConfigMap (no insert). |
 | `/runs/:id` | **Run detail** | Live phase indicator, aggregate stats, streaming per-file table (path · disposition/status · outcome · duration), cancel. |
 | `/detections` | **Corrupt files** | The triage list: path, detected date, run, status; expandable ffmpeg error log; actions: replace, acknowledge, ignore, resolve. Bulk actions. |
-| `/replacements` | **Replacements** | Proposed deletions awaiting **approval** (approve/reject, per-item or batch), plus in-flight/verifying/exhausted history. |
-| `/files` | **Files** | Searchable scan history across the library (path, hash, last scanned, verdict). |
-| `/settings` | **Settings hub** | Tabs below. |
-| `/settings/general` | General | Concurrency, hash algo, detector backend, media extensions, min size, stability gate, scan timeout, retry/replacement caps. |
-| `/settings/integrations` | Integrations | Sonarr/Radarr instances (add/test), path mappings editor. |
-| `/settings/notifications` | Notifications | Pushover keys, per-event toggles, flush interval + batch threshold, test button. |
+| `/replacements` | **Replacements** | Proposed deletions awaiting **approval** (approve/reject, per-item or batch), plus in-flight/verifying/exhausted history. (M5) |
+| `/integrations` | **Integrations** | **Read-only** view of the YAML Sonarr/Radarr instances + their path mappings, with a connection **Test** button per instance. |
+| `/settings` | **Settings** | Read-only effective runtime config (DEFAULTS + YAML `settings:`). |
 
 Design touches: live-updating progress via SSE, optimistic triage actions, empty
 states, toast on notifications, colour-coded status badges (green ok / amber
@@ -805,10 +844,11 @@ unreadable / red corrupt).
 
 ## 13. Configuration & Settings
 
-Layered: **env vars** (deploy-time: DB path, media mount roots, encryption key,
-**mutating-route shared secret**, log level) → **`settings` table** (runtime-editable
-via UI). **This section is the canonical list of tunables and their defaults**
-(values echoed in other sections' comments are illustrative — defaults live here):
+Layered: **env vars** (`SCANRR_*`: `database_url`, `config_file`,
+`api_token` — the mutating-route shared secret, `log_level`) → **YAML `settings:`**
+(§0) → code **`DEFAULTS`**. Effective config = `DEFAULTS` overlaid with the YAML
+`settings:` stanza. **This section is the canonical list of tunables and their
+defaults** (values echoed in other sections' comments are illustrative):
 `max_scan_workers`, `hash_algorithm`, `detector_backend`, `media_extensions`,
 `min_file_size_bytes`, `min_file_age_seconds` (stability gate, default 120),
 `max_scan_seconds` (per-file timeout, default 1800),
@@ -824,8 +864,10 @@ Notifications: `notification_flush_interval` (default 300s),
 
 ## 14. Security & Safety
 
-- **Secrets at rest:** arr API keys and Pushover tokens encrypted with a key from
-  env/k8s Secret (Fernet). Never returned in plaintext by the API.
+- **Secrets in the mounted config:** arr API keys live in the YAML config file (§0),
+  which contains secrets and so should be mounted from a **Kubernetes Secret** (not a
+  ConfigMap). Because k8s handles encryption-at-rest and RBAC, there is **no
+  app-level encryption**. The API never returns `api_key`.
 - **Media mounts read-only** — scanrr never writes to the library. The only writes
   to arr-managed files are explicit `auto_replace` deletions via the arr API.
 - **Destructive ops gated:** `auto_replace` off by default; deletions require
@@ -876,13 +918,13 @@ scanrr/
 │   ├── pyproject.toml
 │   ├── alembic/
 │   └── scanrr/
-│       ├── main.py         # FastAPI app + lifespan (scheduler, orchestrator)
-│       ├── api/            # routers
-│       ├── core/           # config, settings, security, events (SSE bus)
-│       ├── db/             # engine, session, models (SQLModel)
-│       ├── scanning/       # hashing, ffmpeg integrity, worker fn, orchestrator
-│       ├── jobs/           # discovery (path, arr), scheduler, queue
-│       └── integrations/   # sonarr, radarr, pushover clients
+│       ├── api/app.py      # FastAPI app + lifespan (loads YAML, starts orchestrator/scheduler)
+│       ├── cli.py          # `scanrr scan <path>` / `scanrr serve`
+│       ├── core/           # config, fileconfig (YAML §0), clock, logging, events (SSE bus)
+│       ├── db/             # engine, models (SQLModel), single-thread Database
+│       ├── scanning/       # integrity, hashing, worker, engine, orchestrator, executor
+│       ├── jobs/           # discovery (path/arr walk), scheduler, queue
+│       └── integrations/   # arr.py (sonarr/radarr clients); pushover (M5)
 ├── frontend/
 │   ├── package.json
 │   └── src/                # React app (routes, components, api client, sse)
@@ -901,7 +943,7 @@ _All resolved for v1 — kept as a decision log._
 2. ~~Concurrent runs vs global serialize.~~ **Concurrent runs over one global,
    path-deduplicated FIFO queue** (§6).
 3. ~~Auto-replace safety on first enable.~~ **Human approval required by default**;
-   per-job `auto_approve_replacements` opt-out; per-run deletion cap (§9).
+   a YAML job's `auto_approve: true` opt-out; per-run deletion cap (§9).
 4. ~~Confirm replacement via polling vs fire-and-forget.~~ **Bounded polling** of arr
    history with a give-up timeout (§9).
 5. ~~Per-file vs batched corrupt notifications.~~ **Queued + periodic flush**;
