@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import AsyncIterator
 
 
 class EventBus:
@@ -25,11 +24,13 @@ class EventBus:
             except asyncio.QueueFull:
                 pass  # slow consumer — drop; it will refetch
 
-    async def subscribe(self) -> AsyncIterator[str]:
+    def subscribe(self) -> asyncio.Queue[str]:
+        """Register a subscriber and return its queue. The caller drains the queue
+        directly (safe to cancel ``queue.get()`` for heartbeats) and must call
+        ``unsubscribe`` when done."""
         queue: asyncio.Queue[str] = asyncio.Queue(maxsize=self._max_queue)
         self._subscribers.add(queue)
-        try:
-            while True:
-                yield await queue.get()
-        finally:
-            self._subscribers.discard(queue)
+        return queue
+
+    def unsubscribe(self, queue: asyncio.Queue[str]) -> None:
+        self._subscribers.discard(queue)

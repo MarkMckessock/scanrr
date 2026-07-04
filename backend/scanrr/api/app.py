@@ -263,18 +263,18 @@ async def events(request: Request) -> StreamingResponse:
     bus: EventBus = request.app.state.bus
 
     async def stream():
-        source = bus.subscribe()
+        queue = bus.subscribe()
         try:
             while True:
                 try:
-                    data = await asyncio.wait_for(source.__anext__(), timeout=15)
+                    data = await asyncio.wait_for(queue.get(), timeout=15)
                     yield f"data: {data}\n\n"
                 except TimeoutError:
-                    yield ": ping\n\n"  # heartbeat
+                    yield ": ping\n\n"  # heartbeat (cancelling queue.get() is safe)
                 if await request.is_disconnected():
                     break
         finally:
-            await source.aclose()
+            bus.unsubscribe(queue)
 
     return StreamingResponse(stream(), media_type="text/event-stream")
 

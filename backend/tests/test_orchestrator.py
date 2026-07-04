@@ -215,11 +215,15 @@ async def test_orchestrator_publishes_events(eng, media, tmp_path):
     events: list[dict] = []
 
     async def consume() -> None:
-        async for data in bus.subscribe():
-            event = json.loads(data)
-            events.append(event)
-            if event["type"] == "run.completed":
-                return
+        queue = bus.subscribe()
+        try:
+            while True:
+                event = json.loads(await queue.get())
+                events.append(event)
+                if event["type"] == "run.completed":
+                    return
+        finally:
+            bus.unsubscribe(queue)
 
     consumer = asyncio.create_task(consume())
     await asyncio.sleep(0.05)  # let the consumer subscribe before we publish
